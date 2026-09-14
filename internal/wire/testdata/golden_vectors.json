@@ -1,0 +1,12 @@
+{
+  "varints": {"0":"00", "63":"3f", "64":"4040", "16383":"7fff", "16384":"80004000"},
+  "reliable_channel_1_event_type_10_aabb":"01010501010aaabb",
+  "unreliable_channel_1_type_10_aabb":"02010aaabb",
+  "sequenced_channel_1_type_10_sequence_2_aabb":"03010a02aabb",
+  "request_type_20_timeout_1000_aa":"021443e801aa",
+  "response_success_bb":"0001bb",
+  "response_unknown_empty":"0d00",
+  "custom_stream_type_30":"031e",
+  "custom_stream_accepted":"00",
+  "control_close_ack":"127b226f70223a22636c6f73655f61636b227d"
+}

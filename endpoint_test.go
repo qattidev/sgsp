@@ -1,0 +1,1334 @@
+package sgsp
+
+import (
+	"bytes"
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
+	"io"
+	"math/big"
+	"net"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"qattidev/sgsp/internal/quictransport"
+	"qattidev/sgsp/internal/transport"
+	"qattidev/sgsp/internal/wire"
+)
+
+type testAuthenticator struct {
+	calls          atomic.Int32
+	expires        time.Duration
+	refreshExpires time.Duration
+}
+
+type countedReceiveStream struct {
+	reader bytes.Reader
+	reads  atomic.Int64
+}
+
+func newCountedReceiveStream(payload []byte) *countedReceiveStream {
+	stream := &countedReceiveStream{}
+	stream.reader.Reset(payload)
+	return stream
+}
+
+func (s *countedReceiveStream) Read(payload []byte) (int, error) {
+	count, err := s.reader.Read(payload)
+	s.reads.Add(int64(count))
+	return count, err
+}
+func (*countedReceiveStream) CloseRead()                      {}
+func (*countedReceiveStream) SetReadDeadline(time.Time) error { return nil }
+
+func (a *testAuthenticator) Authenticate(_ context.Context, credential Credential) (Principal, error) {
+	a.calls.Add(1)
+	if string(credential.Data) != "valid" && string(credential.Data) != "refresh" {
+		return Principal{}, ErrUnauthenticated
+	}
+	expires := a.expires
+	if string(credential.Data) == "refresh" && a.refreshExpires != 0 {
+		expires = a.refreshExpires
+	}
+	if expires == 0 {
+		expires = time.Minute
+	}
+	return Principal{Issuer: "test", Subject: "player", ExpiresAt: time.Now().Add(expires)}, nil
+}
+
+type testAdmissionVerifier struct{ admission Admission }
+
+func (v *testAdmissionVerifier) Verify(_ context.Context, ticket string) (Admission, error) {
+	if ticket != "ticket" {
+		return Admission{}, ErrForbidden
+	}
+	return v.admission, nil
+}
+
+func endpointCertificate(t *testing.T) (tls.Certificate, *x509.CertPool) {
+	t.Helper()
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "localhost"}, DNSNames: []string{"localhost"}, NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(time.Hour), KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, public, private)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(parsed)
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: private}, pool
+}
+
+func TestAuthenticationBarrier(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	authenticator := &testAuthenticator{}
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: authenticator, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	clientConfig := ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, clientConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.Session().State() != Active || client.Session().Principal().Subject != "player" {
+		t.Fatalf("unauthenticated session state: %#v", client.Session())
+	}
+	if authenticator.calls.Load() != 1 || len(server.Sessions()) != 1 {
+		t.Fatalf("authentication/session commit = %d/%d", authenticator.calls.Load(), len(server.Sessions()))
+	}
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRejectedCredentialsNeverCreateSession(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err = Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("invalid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err == nil {
+		t.Fatal("invalid credentials connected")
+	}
+	if len(server.Sessions()) != 0 {
+		t.Fatal("rejected credentials created an active session")
+	}
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAdmissionBinding(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifier := &testAdmissionVerifier{}
+	var authorized atomic.Int32
+	var committed atomic.Int32
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Admission: verifier, AuthorizeGroup: func(_ context.Context, principal Principal, group string) error {
+		if principal.Subject != "player" || group != "match" {
+			return ErrForbidden
+		}
+		authorized.Add(1)
+		return nil
+	}, CommitGroupClose: func(_ context.Context, app AppIdentity, group string, owner Owner) error {
+		if app != (AppIdentity{ID: "app", Version: "1"}) || group != "match" || owner.ID != "server" {
+			return ErrInvalidArgument
+		}
+		committed.Add(1)
+		return nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := server.Owner()
+	verifier.admission = Admission{App: AppIdentity{ID: "app", Version: "1"}, PrincipalIssuer: "test", Subject: "player", GroupKey: "match", Owner: owner, ExpiresAt: time.Now().Add(time.Minute)}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, GroupKey: "match", AdmissionTicket: "ticket", Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authorized.Load() != 1 {
+		t.Fatalf("authorizer calls = %d", authorized.Load())
+	}
+	if err := server.CloseGroup(ctx, "match"); err != nil {
+		t.Fatal(err)
+	}
+	if committed.Load() != 1 {
+		t.Fatalf("group close commits = %d", committed.Load())
+	}
+	select {
+	case <-client.Session().Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("group close did not close session")
+	}
+	_ = client.Close(context.Background())
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAuthenticationExpirationClosesSession(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{expires: 25 * time.Millisecond}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-client.Session().Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("expired session remained active")
+	}
+	if client.Session().State() != Closed {
+		t.Fatalf("expired state = %v", client.Session().State())
+	}
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAuthRefresh(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	authenticator := &testAuthenticator{expires: time.Second, refreshExpires: 2 * time.Second}
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: authenticator, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := client.Session().Principal().ExpiresAt
+	if err := client.Session().RefreshAuth(ctx, Credential{Scheme: "test", Data: []byte("refresh")}); err != nil {
+		t.Fatal(err)
+	}
+	if after := client.Session().Principal().ExpiresAt; !after.After(before) {
+		t.Fatalf("expiration did not advance: %v <= %v", after, before)
+	}
+	if got := server.Sessions()[0].Principal().ExpiresAt; !got.After(before) {
+		t.Fatalf("server expiration did not advance: %v", got)
+	}
+	_ = client.Close(context.Background())
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLogicalCloseAcknowledgedAndTerminalLifecycleDrains(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Polling}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Close(ctx); err != nil {
+		t.Fatalf("Close = %v", err)
+	}
+	terminal, err := client.Next(ctx)
+	if err != nil {
+		t.Fatalf("terminal Next = %v", err)
+	}
+	defer terminal.Release()
+	if terminal.Kind != LifecycleMessage || terminal.Lifecycle == nil || terminal.Lifecycle.Kind != SessionEnded || terminal.Lifecycle.Reason != Normal {
+		t.Fatalf("terminal lifecycle = %#v", terminal)
+	}
+	if _, err := client.Next(ctx); err != ErrSessionClosed {
+		t.Fatalf("Next after terminal = %v", err)
+	}
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAuthenticatedEventDelivery(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := make(chan string, 3)
+	router := NewRouter()
+	if err := router.OnEvent(7, func(_ context.Context, incoming *Incoming) {
+		events <- string(incoming.Payload) + ":" + map[Delivery]string{ReliableOrdered: "reliable", Unreliable: "unreliable"}[incoming.Delivery]
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Dispatch: DispatchConfig{Mode: Handlers, Router: router}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Session().Send(ctx, 7, []byte("command"), SendOptions{Delivery: ReliableOrdered}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case value := <-events:
+		if value != "command:reliable" {
+			t.Fatalf("reliable event = %q", value)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reliable event was not delivered")
+	}
+	if err := client.Session().Send(ctx, 7, []byte("command-two"), SendOptions{Delivery: ReliableOrdered}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case value := <-events:
+		if value != "command-two:reliable" {
+			t.Fatalf("second reliable event = %q", value)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second reliable event was not delivered")
+	}
+	if err := client.Session().Send(ctx, 7, []byte("input"), SendOptions{Channel: 1, Delivery: Unreliable}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case value := <-events:
+		if value != "input:unreliable" {
+			t.Fatalf("datagram event = %q", value)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("datagram event was not delivered")
+	}
+	_ = client.Close(context.Background())
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAuthenticatedRequestReply(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := NewRouter()
+	if err := router.OnRequest(8, func(ctx context.Context, incoming *Incoming) {
+		if err := incoming.Reply(ctx, append([]byte("echo:"), incoming.Payload...)); err != nil {
+			t.Errorf("reply: %v", err)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.OnRequest(9, func(ctx context.Context, incoming *Incoming) {
+		if err := incoming.Fail(ctx, Forbidden, "not permitted"); err != nil {
+			t.Errorf("fail: %v", err)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Dispatch: DispatchConfig{Mode: Handlers, Router: router}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.Session().Call(ctx, 8, []byte("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(response) != "echo:hello" {
+		t.Fatalf("response = %q", response)
+	}
+	_, err = client.Session().Call(ctx, 9, nil)
+	if remote, ok := err.(*Error); !ok || remote.Code != Forbidden || remote.Message != "not permitted" {
+		t.Fatalf("remote failure = %#v", err)
+	}
+	_ = client.Close(context.Background())
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAuthenticatedRequestLossHasUnknownOutcome(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := NewRouter()
+	if err := router.OnRequest(23, func(_ context.Context, incoming *Incoming) {
+		_ = incoming.Session.Close(context.Background(), Internal)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Dispatch: DispatchConfig{Mode: Handlers, Router: router}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Session().Call(ctx, 23, []byte("operation"))
+	var protocol *Error
+	if !errors.As(err, &protocol) || !protocol.OutcomeUnknown {
+		t.Fatalf("Call error = %#v", err)
+	}
+	_ = client.Close(context.Background())
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPeerReceiveLimitsBoundOutboundMessages(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits := DefaultLimits()
+	limits.MessageBytes = 10
+	limits.QueueBytes = 2 * (limits.MessageBytes + 32)
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Limits: limits, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.Session().Send(ctx, 1, make([]byte, limits.MessageBytes+1), SendOptions{Delivery: ReliableOrdered})
+	var protocol *Error
+	if !errors.As(err, &protocol) || protocol.Code != TooLarge || protocol.MaxPayload != limits.MessageBytes {
+		t.Fatalf("Send error = %#v", err)
+	}
+	_ = client.Close(context.Background())
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFullJitterStaysWithinBackoffCap(t *testing.T) {
+	if delay := fullJitter(0); delay != 0 {
+		t.Fatalf("zero jitter = %v", delay)
+	}
+	maximum := 5 * time.Millisecond
+	for range 100 {
+		if delay := fullJitter(maximum); delay < 0 || delay > maximum {
+			t.Fatalf("jitter delay = %v, maximum = %v", delay, maximum)
+		}
+	}
+}
+
+func TestClientWelcomeValidation(t *testing.T) {
+	secret := make([]byte, 32)
+	welcome := welcomeMessage{Epoch: "1", Principal: principalMessage{ExpiresMS: time.Now().Add(time.Minute).UnixMilli()}, Resumable: true, ResumeGraceMS: 1000, ResumeSecret: base64.RawURLEncoding.EncodeToString(secret)}
+	if err := validateClientWelcome(welcome, GameRole, false); err != nil {
+		t.Fatalf("valid game welcome = %v", err)
+	}
+	bad := welcome
+	bad.ResumeSecret = ""
+	if err := validateClientWelcome(bad, GameRole, false); err == nil {
+		t.Fatal("missing game resume secret accepted")
+	}
+	resumed := welcome
+	resumed.Resumed, resumed.Epoch, resumed.ResumeSecret = true, "2", ""
+	if err := validateClientWelcome(resumed, GameRole, true); err != nil {
+		t.Fatalf("valid resumed welcome = %v", err)
+	}
+	resumed.ResumeSecret = welcome.ResumeSecret
+	if err := validateClientWelcome(resumed, GameRole, true); err == nil {
+		t.Fatal("resumed welcome rotated secret")
+	}
+	bootstrap := welcomeMessage{Epoch: "1", Principal: principalMessage{ExpiresMS: time.Now().Add(time.Minute).UnixMilli()}}
+	if err := validateClientWelcome(bootstrap, BootstrapRole, false); err != nil {
+		t.Fatalf("valid bootstrap welcome = %v", err)
+	}
+}
+
+func TestAuthenticatedCustomStream(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := NewRouter()
+	streamStarted := make(chan struct{}, 1)
+	events := make(chan struct{}, 1)
+	if err := router.OnEvent(11, func(context.Context, *Incoming) { events <- struct{}{} }); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.OnStream(10, func(_ context.Context, incoming *Incoming) {
+		streamStarted <- struct{}{}
+		payload, err := io.ReadAll(incoming.Stream)
+		if err != nil {
+			t.Errorf("read stream: %v", err)
+			return
+		}
+		if _, err := incoming.Stream.Write(append([]byte("echo:"), payload...)); err != nil {
+			t.Errorf("write stream: %v", err)
+			return
+		}
+		if err := incoming.Stream.CloseWrite(); err != nil {
+			t.Errorf("close response: %v", err)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Dispatch: DispatchConfig{Mode: Handlers, Router: router}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := client.Session().OpenStream(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-streamStarted:
+	case <-time.After(time.Second):
+		t.Fatal("stream handler did not start")
+	}
+	if err := client.Session().Send(ctx, 11, []byte("ordinary"), SendOptions{Delivery: ReliableOrdered}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-events:
+	case <-time.After(time.Second):
+		t.Fatal("ordinary event was blocked behind active custom stream")
+	}
+	if _, err := stream.Write([]byte("bytes")); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	response, err := io.ReadAll(stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(response) != "echo:bytes" {
+		t.Fatalf("stream response = %q", response)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_ = client.Close(context.Background())
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPollingEndpointDispatch(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Dispatch: DispatchConfig{Mode: Polling}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Polling}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverOpened, err := server.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if serverOpened.Kind != LifecycleMessage || serverOpened.Lifecycle.Kind != Opened {
+		t.Fatalf("server opened = %#v", serverOpened)
+	}
+	serverOpened.Release()
+	clientOpened, err := client.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clientOpened.Kind != LifecycleMessage || clientOpened.Lifecycle.Kind != Opened {
+		t.Fatalf("client opened = %#v", clientOpened)
+	}
+	clientOpened.Release()
+	if err := client.Session().Send(ctx, 11, []byte("to-server"), SendOptions{Delivery: ReliableOrdered}); err != nil {
+		t.Fatal(err)
+	}
+	serverEvent, err := server.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if serverEvent.Kind != Event || string(serverEvent.Payload) != "to-server" {
+		t.Fatalf("server event = %#v", serverEvent)
+	}
+	serverEvent.Release()
+	if err := server.Sessions()[0].Send(ctx, 12, []byte("to-client"), SendOptions{Delivery: ReliableOrdered}); err != nil {
+		t.Fatal(err)
+	}
+	clientEvent, err := client.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clientEvent.Kind != Event || string(clientEvent.Payload) != "to-client" {
+		t.Fatalf("client event = %#v", clientEvent)
+	}
+	clientEvent.Release()
+	callResult := make(chan struct {
+		payload []byte
+		err     error
+	}, 1)
+	go func() {
+		payload, err := client.Session().Call(ctx, 13, []byte("request"))
+		callResult <- struct {
+			payload []byte
+			err     error
+		}{payload, err}
+	}()
+	request, err := server.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.Kind != RequestMessage || string(request.Payload) != "request" {
+		t.Fatalf("server request = %#v", request)
+	}
+	if err := request.Reply(ctx, []byte("response")); err != nil {
+		t.Fatal(err)
+	}
+	request.Release()
+	result := <-callResult
+	if result.err != nil || string(result.payload) != "response" {
+		t.Fatalf("Call = %q, %v", result.payload, result.err)
+	}
+	_ = client.Close(context.Background())
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestResumeIdentity(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lifecycles := make(chan LifecycleKind, 3)
+	router := NewRouter()
+	if err := router.OnLifecycle(func(_ context.Context, incoming *Incoming) { lifecycles <- incoming.Lifecycle.Kind }); err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Dispatch: DispatchConfig{Mode: Handlers, Router: router}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case kind := <-lifecycles:
+		if kind != Opened {
+			t.Fatalf("initial lifecycle = %v", kind)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("missing Opened lifecycle")
+	}
+	clientSession := client.Session()
+	clientSession.SetAttachment("retained")
+	beforeID, beforeEpoch := clientSession.ID(), clientSession.Epoch()
+	serverSession := endpoint.Sessions()[0].(*sessionRecord)
+	if err := closeCurrentTransport(serverSession, "forced loss"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.NewTimer(4 * time.Second)
+	defer deadline.Stop()
+	for clientSession.State() != Active || clientSession.Epoch() <= beforeEpoch || len(endpoint.Sessions()) != 1 || endpoint.Sessions()[0].Epoch() <= beforeEpoch {
+		select {
+		case <-time.After(10 * time.Millisecond):
+		case <-deadline.C:
+			t.Fatalf("resume state client=%v/%d server=%d sessions=%d", clientSession.State(), clientSession.Epoch(), func() uint64 {
+				if len(endpoint.Sessions()) == 0 {
+					return 0
+				}
+				return endpoint.Sessions()[0].Epoch()
+			}(), len(endpoint.Sessions()))
+		}
+	}
+	if clientSession.ID() != beforeID || clientSession.Attachment() != "retained" {
+		t.Fatalf("resume did not retain identity/attachment: %x %#v", clientSession.ID(), clientSession.Attachment())
+	}
+	select {
+	case kind := <-lifecycles:
+		if kind != ConnectionLost {
+			t.Fatalf("loss lifecycle = %v", kind)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("missing ConnectionLost lifecycle")
+	}
+	select {
+	case kind := <-lifecycles:
+		if kind != Resumed {
+			t.Fatalf("resumed lifecycle = %v", kind)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("missing Resumed lifecycle")
+	}
+	_ = client.Close(context.Background())
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLostResumeWelcome(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	concrete := client.(*clientEndpoint)
+	concrete.mu.Lock()
+	concrete.reconnecting = true // Test drives retries explicitly.
+	concrete.mu.Unlock()
+	serverSession := endpoint.Sessions()[0].(*sessionRecord)
+	if err := closeCurrentTransport(serverSession, "force suspended"); err != nil {
+		t.Fatal(err)
+	}
+	waitForSessionState(t, ctx, concrete.session, Suspended, 1)
+	waitForSessionState(t, ctx, serverSession, Suspended, 1)
+	secret := concrete.resumeSecret
+	discardedPacket, discardedConnection, err := sendResumeAndDiscardWelcome(ctx, concrete)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForSessionState(t, ctx, serverSession, Active, 2)
+	_ = discardedConnection.Close(uint64(Internal), "discard resume welcome")
+	_ = discardedPacket.Close()
+	waitForSessionState(t, ctx, serverSession, Suspended, 2)
+	attachment, err := concrete.openResume(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := concrete.attachResume(attachment); err != nil {
+		t.Fatal(err)
+	}
+	concrete.mu.Lock()
+	concrete.reconnecting = false
+	concrete.mu.Unlock()
+	waitForSessionState(t, ctx, concrete.session, Active, 3)
+	if concrete.resumeSecret != secret || concrete.session.ID() != serverSession.ID() {
+		t.Fatal("lost WELCOME retry rotated or replaced resume identity")
+	}
+	_ = client.Close(context.Background())
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestResumeGrace(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits := DefaultLimits()
+	limits.ResumeGrace = 75 * time.Millisecond
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Limits: limits, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Limits: limits, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	concrete := client.(*clientEndpoint)
+	concrete.mu.Lock()
+	concrete.reconnecting = true // Exercise grace manually.
+	concrete.mu.Unlock()
+	serverSession := endpoint.Sessions()[0].(*sessionRecord)
+	if err := closeCurrentTransport(serverSession, "first loss"); err != nil {
+		t.Fatal(err)
+	}
+	waitForSessionState(t, ctx, serverSession, Suspended, 1)
+	attachment, err := concrete.openResume(ctx)
+	if err != nil {
+		t.Fatalf("resume before grace = %v", err)
+	}
+	if err := concrete.attachResume(attachment); err != nil {
+		t.Fatalf("attach before grace = %v", err)
+	}
+	waitForSessionState(t, ctx, concrete.session, Active, 2)
+	if err := closeCurrentTransport(serverSession, "second loss"); err != nil {
+		t.Fatal(err)
+	}
+	waitForSessionState(t, ctx, serverSession, Suspended, 2)
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for {
+		_, code := endpoint.lookupSession(serverSession.ID())
+		if code == SessionExpired {
+			break
+		}
+		select {
+		case <-time.After(time.Millisecond):
+		case <-deadline.C:
+			t.Fatal("suspended session remained resumable after grace")
+		}
+	}
+	_ = client.Close(context.Background())
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTransportLossDiscardsPollingEpochQueue(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Dispatch: DispatchConfig{Mode: Polling}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, DisableReconnect: true, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := server.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opened.Kind != LifecycleMessage || opened.Lifecycle == nil || opened.Lifecycle.Kind != Opened {
+		t.Fatalf("initial polling item = %#v", opened)
+	}
+	opened.Release()
+	if err := client.Session().Send(ctx, 91, []byte("queued-before-loss"), SendOptions{Delivery: ReliableOrdered}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for endpoint.applicationBudget.Used() == 0 {
+		select {
+		case <-time.After(time.Millisecond):
+		case <-deadline.C:
+			t.Fatal("reliable event did not enter the polling queue")
+		}
+	}
+	serverSession := endpoint.Sessions()[0].(*sessionRecord)
+	if err := closeCurrentTransport(serverSession, "force polling loss"); err != nil {
+		t.Fatal(err)
+	}
+	waitForSessionState(t, ctx, serverSession, Suspended, 1)
+	loss, err := server.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loss.Kind != LifecycleMessage || loss.Lifecycle == nil || loss.Lifecycle.Kind != ConnectionLost {
+		t.Fatalf("post-loss polling item = %#v", loss)
+	}
+	loss.Release()
+	if used := endpoint.applicationBudget.Used(); used != 0 {
+		t.Fatalf("discarded polling payload remains charged: %d bytes", used)
+	}
+	empty, emptyCancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer emptyCancel()
+	if _, err := server.Next(empty); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("discarded epoch was still deliverable: %v", err)
+	}
+	_ = client.Close(context.Background())
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReliableReaderReservesBeforeReadingBody(t *testing.T) {
+	limits := DefaultLimits()
+	limits.QueueBytes, limits.QueueMessages = 1024, 1
+	operations := &connectionOperations{mode: Polling}
+	session := newSessionRecord(SessionID{1}, Owner{}, "", Principal{ExpiresAt: time.Now().Add(time.Minute)}, limits, false, operations)
+	operations.session, operations.epoch = session, 1
+	operations.incoming = newIncomingQueue(int64(limits.QueueBytes), limits.QueueMessages, nil)
+	operations.startEpoch()
+	held := &Incoming{Kind: Event, Session: session, Epoch: 1, Type: 1, Payload: make([]byte, 32)}
+	if !operations.incoming.Push(held, incomingCharge(held)) {
+		t.Fatal("could not fill polling queue")
+	}
+	channel, err := wire.EncodeReliableChannelHeaderFor(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame, err := wire.EncodeReliableEvent(wire.Event{Channel: 1, MessageType: 2, Payload: []byte("body-remains-unread")}, limits.MessageBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloadBytes := len("body-remains-unread")
+	stream := newCountedReceiveStream(append(channel, frame...))
+	go operations.readReliableStream(stream)
+	headerBytes := len(channel) + len(frame) - payloadBytes
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for stream.reads.Load() < int64(headerBytes) {
+		select {
+		case <-time.After(time.Millisecond):
+		case <-deadline.C:
+			t.Fatalf("reader did not consume reliable header: %d/%d", stream.reads.Load(), headerBytes)
+		}
+	}
+	if got := stream.reads.Load(); got != int64(headerBytes) {
+		t.Fatalf("reader consumed %d body bytes before capacity was available", got-int64(headerBytes))
+	}
+	item, err := operations.incoming.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.Release()
+	result, err := operations.incoming.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer result.Release()
+	if result.Type != 2 || string(result.Payload) != "body-remains-unread" {
+		t.Fatalf("delivered reliable event = %#v", result)
+	}
+}
+
+func waitForSessionState(t *testing.T, ctx context.Context, session Session, state State, minimumEpoch uint64) {
+	t.Helper()
+	for session.State() != state || session.Epoch() < minimumEpoch {
+		select {
+		case <-time.After(time.Millisecond):
+		case <-ctx.Done():
+			t.Fatalf("session state/epoch = %v/%d, want %v/>=%d: %v", session.State(), session.Epoch(), state, minimumEpoch, ctx.Err())
+		}
+	}
+}
+
+func closeCurrentTransport(session *sessionRecord, message string) error {
+	session.mu.RLock()
+	operations, _ := session.operations.(*connectionOperations)
+	session.mu.RUnlock()
+	if operations == nil || operations.connection == nil {
+		return ErrSessionClosed
+	}
+	return operations.connection.Close(uint64(Internal), message)
+}
+
+func sendResumeAndDiscardWelcome(ctx context.Context, client *clientEndpoint) (net.PacketConn, transport.Conn, error) {
+	credential, err := client.config.Credentials(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	remote, err := net.ResolveUDPAddr("udp", client.endpoint.Address)
+	if err != nil {
+		return nil, nil, err
+	}
+	packet, err := net.ListenPacket("udp", "[::]:0")
+	if err != nil {
+		return nil, nil, err
+	}
+	fail := func(err error) (net.PacketConn, transport.Conn, error) {
+		_ = packet.Close()
+		return nil, nil, err
+	}
+	tlsConfig := client.config.TLS.Clone()
+	tlsConfig.ServerName = client.endpoint.ServerName
+	connection, err := quictransport.Dial(ctx, packet, remote, transportConfig(tlsConfig, client.limits))
+	if err != nil {
+		return fail(err)
+	}
+	stream, err := connection.OpenBidi(ctx)
+	if err != nil {
+		_ = connection.Close(uint64(Internal), "resume control stream")
+		return fail(err)
+	}
+	id, owner := client.session.ID(), client.session.Owner()
+	hello := helloMessage{Op: "hello", Role: roleName(client.config.Role), App: client.config.App, Required: []string{"datagrams"}, Limits: limitMessageFrom(client.limits), Credential: credentialMessage{Scheme: credential.Scheme, Data: base64.RawURLEncoding.EncodeToString(credential.Data)}, Resume: &resumeMessage{SessionID: hex.EncodeToString(id[:]), OwnerID: owner.ID, Incarnation: hex.EncodeToString(owner.Incarnation[:]), Secret: client.resumeSecret}}
+	if err := newControlChannel(stream).write(hello); err != nil {
+		_ = connection.Close(uint64(Internal), "resume hello failed")
+		return fail(err)
+	}
+	return packet, connection, nil
+}
+
+func TestDrain(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer drainCancel()
+	if err := server.Drain(drainCtx); err != context.DeadlineExceeded {
+		t.Fatalf("Drain = %v", err)
+	}
+	select {
+	case <-client.Session().Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("drain did not close active session")
+	}
+	emptyCtx, emptyCancel := context.WithTimeout(context.Background(), time.Second)
+	defer emptyCancel()
+	if err := server.Drain(emptyCtx); err != nil {
+		t.Fatalf("empty Drain = %v", err)
+	}
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReliableRateLimit(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits := DefaultLimits()
+	limits.MessagesPerSessionPerSecond, limits.MessageBurstPerSession = 1, 1
+	delivered := make(chan struct{}, 1)
+	router := NewRouter()
+	if err := router.OnEvent(21, func(context.Context, *Incoming) { delivered <- struct{}{} }); err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Limits: limits, Dispatch: DispatchConfig{Mode: Handlers, Router: router}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Session().Send(ctx, 21, []byte("first"), SendOptions{Delivery: ReliableOrdered}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-delivered:
+	case <-time.After(time.Second):
+		t.Fatal("first event was not delivered")
+	}
+	if err := client.Session().Send(ctx, 21, []byte("second"), SendOptions{Delivery: ReliableOrdered}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-client.Session().Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("rate limit did not close session")
+	}
+	if client.Session().State() != Closed {
+		t.Fatalf("client state = %v", client.Session().State())
+	}
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRequestSlots(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, release := make(chan struct{}, 1), make(chan struct{})
+	router := NewRouter()
+	if err := router.OnRequest(22, func(ctx context.Context, incoming *Incoming) {
+		started <- struct{}{}
+		<-release
+		_ = incoming.Reply(ctx, []byte("ok"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Dispatch: DispatchConfig{Mode: Handlers, Router: router}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	limits := DefaultLimits()
+	limits.Requests = 1
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Limits: limits, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := make(chan error, 1)
+	go func() { _, err := client.Session().Call(ctx, 22, nil); first <- err }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first request did not reach handler")
+	}
+	if _, err := client.Session().Call(ctx, 22, nil); err != ErrResourceExhausted {
+		t.Fatalf("second call = %v", err)
+	}
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatalf("first call = %v", err)
+	}
+	_ = client.Close(context.Background())
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
