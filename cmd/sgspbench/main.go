@@ -78,7 +78,22 @@ func validate(cfg config, output string) error {
 	if cfg.Implementation != "sgsp" && cfg.Implementation != "quic" {
 		return errors.New("--implementation must be sgsp or quic")
 	}
-	if cfg.Clients < 1 || (cfg.Hz != 60 && cfg.Hz != 128) || cfg.InputBytes < 0 || cfg.InputBytes > 1000 || cfg.UpdateBytes < 0 || cfg.UpdateBytes > 1000 || cfg.RPCPerSecond < 0 || cfg.BulkBytes < 0 || cfg.Warmup < 0 || cfg.Duration <= 0 || cfg.RTT < 0 || cfg.Jitter < 0 || cfg.Loss < 0 || cfg.Loss > 1 || cfg.Reorder < 0 || cfg.Reorder > 1 || output == "" {
+	if cfg.Clients < 1 || (cfg.Hz != 60 && cfg.Hz != 128) ||
+		cfg.InputBytes < 0 ||
+		cfg.InputBytes > 1000 ||
+		cfg.UpdateBytes < 0 ||
+		cfg.UpdateBytes > 1000 ||
+		cfg.RPCPerSecond < 0 ||
+		cfg.BulkBytes < 0 ||
+		cfg.Warmup < 0 ||
+		cfg.Duration <= 0 ||
+		cfg.RTT < 0 ||
+		cfg.Jitter < 0 ||
+		cfg.Loss < 0 ||
+		cfg.Loss > 1 ||
+		cfg.Reorder < 0 ||
+		cfg.Reorder > 1 ||
+		output == "" {
 		return errors.New("invalid benchmark configuration")
 	}
 	return nil
