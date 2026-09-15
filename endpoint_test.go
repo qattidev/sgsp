@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"qattidev/sgsp/internal/quictransport"
+	"qattidev/sgsp/internal/runtime"
 	"qattidev/sgsp/internal/transport"
 	"qattidev/sgsp/internal/wire"
 )
@@ -47,6 +48,17 @@ func (s *countedReceiveStream) Read(payload []byte) (int, error) {
 }
 func (*countedReceiveStream) CloseRead()                      {}
 func (*countedReceiveStream) SetReadDeadline(time.Time) error { return nil }
+
+type countedBidiStream struct {
+	*countedReceiveStream
+	writes bytes.Buffer
+}
+
+func (s *countedBidiStream) Write(payload []byte) (int, error) { return s.writes.Write(payload) }
+func (*countedBidiStream) Close() error                        { return nil }
+func (*countedBidiStream) CloseWrite() error                   { return nil }
+func (*countedBidiStream) Abort(uint64)                        {}
+func (*countedBidiStream) SetDeadline(time.Time) error         { return nil }
 
 func (a *testAuthenticator) Authenticate(_ context.Context, credential Credential) (Principal, error) {
 	a.calls.Add(1)
@@ -1013,12 +1025,17 @@ func TestTransportLossDiscardsPollingEpochQueue(t *testing.T) {
 	<-endpoint.started
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, DisableReconnect: true, Credentials: func(context.Context) (Credential, error) {
+	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Credentials: func(context.Context) (Credential, error) {
 		return Credential{Scheme: "test", Data: []byte("valid")}, nil
 	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Hold reconnection so this test controls the suspended owner explicitly.
+	clientEndpoint := client.(*clientEndpoint)
+	clientEndpoint.mu.Lock()
+	clientEndpoint.reconnecting = true
+	clientEndpoint.mu.Unlock()
 	opened, err := server.Next(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -1060,6 +1077,99 @@ func TestTransportLossDiscardsPollingEpochQueue(t *testing.T) {
 	if _, err := server.Next(empty); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("discarded epoch was still deliverable: %v", err)
 	}
+	_ = client.Close(context.Background())
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTransportLossUnblocksPendingRequestAndStream(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestStarted := make(chan struct{}, 1)
+	streamStarted := make(chan struct{}, 1)
+	router := NewRouter()
+	if err := router.OnRequest(92, func(ctx context.Context, _ *Incoming) {
+		requestStarted <- struct{}{}
+		<-ctx.Done()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.OnStream(93, func(_ context.Context, incoming *Incoming) {
+		streamStarted <- struct{}{}
+		buffer := make([]byte, 1)
+		_, _ = incoming.Stream.Read(buffer)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Dispatch: DispatchConfig{Mode: Handlers, Router: router}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, DisableReconnect: true, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := client.Session().OpenStream(ctx, 93)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-streamStarted:
+	case <-time.After(time.Second):
+		t.Fatal("custom stream did not reach server")
+	}
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := stream.Read(make([]byte, 1))
+		readDone <- err
+	}()
+	callDone := make(chan error, 1)
+	go func() {
+		_, err := client.Session().Call(ctx, 92, []byte("pending"))
+		callDone <- err
+	}()
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("request did not reach server")
+	}
+	serverSession := endpoint.Sessions()[0].(*sessionRecord)
+	if err := closeCurrentTransport(serverSession, "force pending cleanup"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-callDone:
+		var outcome *Error
+		if !errors.As(err, &outcome) || !outcome.OutcomeUnknown {
+			t.Fatalf("pending call result = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pending call remained blocked after transport loss")
+	}
+	select {
+	case err := <-readDone:
+		if err == nil {
+			t.Fatal("blocked custom stream read completed without transport error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("custom stream read remained blocked after transport loss")
+	}
+	waitForSessionState(t, ctx, serverSession, Suspended, 1)
 	_ = client.Close(context.Background())
 	stop()
 	if err := <-serveDone; err != nil {
@@ -1118,13 +1228,241 @@ func TestReliableReaderReservesBeforeReadingBody(t *testing.T) {
 	}
 }
 
+func TestRequestReaderReservesBeforeReadingBody(t *testing.T) {
+	limits := DefaultLimits()
+	limits.QueueBytes, limits.QueueMessages = 1024, 1
+	operations := &connectionOperations{mode: Polling}
+	session := newSessionRecord(SessionID{2}, Owner{}, "", Principal{ExpiresAt: time.Now().Add(time.Minute)}, limits, false, operations)
+	operations.session, operations.epoch = session, 1
+	operations.incoming = newIncomingQueue(int64(limits.QueueBytes), limits.QueueMessages, nil)
+	operations.startEpoch()
+	held := &Incoming{Kind: Event, Session: session, Epoch: 1, Type: 1, Payload: make([]byte, 32)}
+	if !operations.incoming.Push(held, incomingCharge(held)) {
+		t.Fatal("could not fill polling queue")
+	}
+	requestPayload := []byte("request-body-remains-unread")
+	frame, err := wire.EncodeRequest(wire.Request{MessageType: 3, TimeoutMS: 1_000, Payload: requestPayload}, limits.MessageBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := &countedBidiStream{countedReceiveStream: newCountedReceiveStream(frame)}
+	go operations.readApplicationStream(stream)
+	headerBytes := len(frame) - len(requestPayload)
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for stream.reads.Load() < int64(headerBytes) {
+		select {
+		case <-time.After(time.Millisecond):
+		case <-deadline.C:
+			t.Fatalf("reader did not consume request header: %d/%d", stream.reads.Load(), headerBytes)
+		}
+	}
+	if got := stream.reads.Load(); got != int64(headerBytes) {
+		t.Fatalf("reader consumed %d request-body bytes before capacity was available", got-int64(headerBytes))
+	}
+	item, err := operations.incoming.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.Release()
+	request, err := operations.incoming.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.Kind != RequestMessage || request.Type != 3 || string(request.Payload) != string(requestPayload) {
+		t.Fatalf("delivered request = %#v", request)
+	}
+	if err := request.Fail(context.Background(), Canceled, "test complete"); err != nil {
+		t.Fatal(err)
+	}
+	request.Release()
+}
+
+func TestMalformedApplicationStreamClosesSession(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverSession := endpoint.Sessions()[0].(*sessionRecord)
+	concrete := client.(*clientEndpoint)
+	stream, err := concrete.connection.OpenBidi(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stream.Write([]byte{99}); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-serverSession.Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("malformed application stream did not close server session")
+	}
+	if serverSession.terminalCode() != ProtocolViolation {
+		t.Fatalf("malformed stream terminal code = %v", serverSession.terminalCode())
+	}
+	_ = client.Close(context.Background())
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTruncatedReliableStreamClosesSession(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverSession := endpoint.Sessions()[0].(*sessionRecord)
+	concrete := client.(*clientEndpoint)
+	stream, err := concrete.connection.OpenUni(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header, err := wire.EncodeReliableChannelHeaderFor(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stream.Write(header); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-serverSession.Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("truncated reliable stream did not close server session")
+	}
+	if serverSession.terminalCode() != ProtocolViolation {
+		t.Fatalf("truncated reliable stream terminal code = %v", serverSession.terminalCode())
+	}
+	_ = client.Close(context.Background())
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOutgoingFrameReservationUsesGlobalBudget(t *testing.T) {
+	budget := runtime.NewBudget(64)
+	operations := &connectionOperations{applicationBudget: budget}
+	if _, err := operations.reserveOutgoing(65); err != ErrBackpressure {
+		t.Fatalf("oversized outgoing reservation = %v", err)
+	}
+	release, err := operations.reserveOutgoing(64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if used := budget.Used(); used != 64 {
+		t.Fatalf("reserved outgoing bytes = %d", used)
+	}
+	release()
+	release()
+	if used := budget.Used(); used != 0 {
+		t.Fatalf("outgoing release retained %d bytes", used)
+	}
+}
+
+func TestFrameReservationsUsePersistentDirectionalBudgets(t *testing.T) {
+	limits := DefaultLimits()
+	limits.QueueBytes = 64
+	session := newSessionRecord(SessionID{3}, Owner{}, "", Principal{}, limits, true, nil)
+	global := runtime.NewBudget(128)
+	operations := &connectionOperations{session: session, applicationBudget: global}
+
+	releaseOutgoing, err := operations.reserveOutgoing(64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := operations.reserveOutgoing(1); err != ErrBackpressure {
+		t.Fatalf("outgoing directional limit = %v", err)
+	}
+	releaseIncoming, err := operations.reserveApplicationBytes(64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := operations.reserveApplicationBytes(1); err != ErrBackpressure {
+		t.Fatalf("incoming directional limit = %v", err)
+	}
+	if used := global.Used(); used != 128 {
+		t.Fatalf("combined global charge = %d", used)
+	}
+	releaseOutgoing()
+	releaseIncoming()
+	if used := session.outgoingBudget.Used(); used != 0 {
+		t.Fatalf("outgoing directional release retained %d bytes", used)
+	}
+	if used := session.incomingBudget.Used(); used != 0 {
+		t.Fatalf("incoming directional release retained %d bytes", used)
+	}
+	if used := global.Used(); used != 0 {
+		t.Fatalf("global release retained %d bytes", used)
+	}
+
+	if !global.Acquire(128) {
+		t.Fatal("occupy global budget")
+	}
+	if _, err := operations.reserveApplicationBytes(1); err != ErrBackpressure {
+		t.Fatalf("global limit = %v", err)
+	}
+	if used := session.incomingBudget.Used(); used != 0 {
+		t.Fatalf("failed global reservation retained incoming charge: %d", used)
+	}
+	global.Release(128)
+}
+
 func waitForSessionState(t *testing.T, ctx context.Context, session Session, state State, minimumEpoch uint64) {
 	t.Helper()
 	for session.State() != state || session.Epoch() < minimumEpoch {
 		select {
 		case <-time.After(time.Millisecond):
 		case <-ctx.Done():
-			t.Fatalf("session state/epoch = %v/%d, want %v/>=%d: %v", session.State(), session.Epoch(), state, minimumEpoch, ctx.Err())
+			terminal := Normal
+			if record, ok := session.(*sessionRecord); ok {
+				terminal = record.terminalCode()
+			}
+			t.Fatalf("session state/epoch/terminal = %v/%d/%v, want %v/>=%d: %v", session.State(), session.Epoch(), terminal, state, minimumEpoch, ctx.Err())
 		}
 	}
 }

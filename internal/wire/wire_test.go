@@ -71,12 +71,24 @@ func TestGoldenVectors(t *testing.T) {
 	if err != nil || !bytes.Equal(request, mustHex(t, "021443e801aa")) {
 		t.Fatalf("request = %x, %v", request, err)
 	}
+	kind, prefix, err := DecodeVarint(request)
+	if err != nil || kind != RequestStreamKind {
+		t.Fatalf("request kind = %d, %d, %v", kind, prefix, err)
+	}
+	requestHeader, payloadBytes, err := ReadRequestHeader(bytes.NewBuffer(request[prefix:]), 64<<10)
+	if err != nil || requestHeader.MessageType != 20 || requestHeader.TimeoutMS != 1000 || payloadBytes != 1 {
+		t.Fatalf("request header = %#v, %d, %v", requestHeader, payloadBytes, err)
+	}
 	if got, err := DecodeRequest(request, 64<<10); err != nil || got.MessageType != 20 || got.TimeoutMS != 1000 || !bytes.Equal(got.Payload, []byte{0xaa}) {
 		t.Fatalf("decode request = %#v, %v", got, err)
 	}
 	response, _ := EncodeResponse(Response{Payload: []byte{0xbb}}, 64<<10)
 	if !bytes.Equal(response, mustHex(t, "0001bb")) {
 		t.Fatalf("response = %x", response)
+	}
+	responseHeader, responseBytes, err := ReadResponseHeader(bytes.NewBuffer(response), 64<<10)
+	if err != nil || responseHeader.Status != 0 || responseBytes != 1 {
+		t.Fatalf("response header = %#v, %d, %v", responseHeader, responseBytes, err)
 	}
 	unknown, _ := EncodeResponse(Response{Status: 13}, 64<<10)
 	if !bytes.Equal(unknown, mustHex(t, "0d00")) {

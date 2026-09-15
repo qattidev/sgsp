@@ -51,9 +51,11 @@ type operationCounts struct {
 }
 
 type relayMeasurement struct {
-	Forwarded, Dropped, PendingPackets uint64 `json:"forwarded" json:"dropped" json:"pending_packets"`
-	PendingBytes                       int64  `json:"pending_bytes"`
-	Overloaded                         bool   `json:"overloaded"`
+	Forwarded      uint64 `json:"forwarded"`
+	Dropped        uint64 `json:"dropped"`
+	PendingPackets uint64 `json:"pending_packets"`
+	PendingBytes   int64  `json:"pending_bytes"`
+	Overloaded     bool   `json:"overloaded"`
 }
 
 type runtimeMeasurement struct {
@@ -72,6 +74,23 @@ type trialCounters struct {
 	updateOffered, updateAccepted, updateDelivered, updateFailed     atomic.Uint64
 	requestOffered, requestAccepted, requestDelivered, requestFailed atomic.Uint64
 	bulkOffered, bulkAccepted, bulkDelivered, bulkFailed             atomic.Uint64
+}
+
+// bulkPacer distributes a byte-per-second target across 100 ten-millisecond
+// writes without rounding the configured workload down.
+type bulkPacer struct {
+	perSecond int
+	remainder int
+}
+
+func (p *bulkPacer) Next() int {
+	if p == nil || p.perSecond <= 0 {
+		return 0
+	}
+	p.remainder += p.perSecond
+	bytes := p.remainder / 100
+	p.remainder %= 100
+	return bytes
 }
 
 func (c *trialCounters) reset() {
@@ -512,7 +531,7 @@ func runBareQUICClient(ctx context.Context, cfg config, connection transport.Con
 		}
 	}()
 	var tick, sequence uint64
-	bulkChunk := max(1, cfg.BulkBytes/100)
+	pacer := bulkPacer{perSecond: cfg.BulkBytes}
 	for {
 		select {
 		case <-ctx.Done():
@@ -537,7 +556,10 @@ func runBareQUICClient(ctx context.Context, cfg config, connection transport.Con
 				counters.requestAccepted.Add(1)
 			}
 		case <-bulk:
-			payload := make([]byte, bulkChunk)
+			payload := make([]byte, pacer.Next())
+			if len(payload) == 0 {
+				continue
+			}
 			counters.bulkOffered.Add(uint64(len(payload)))
 			written, err := stream.Write(payload)
 			if written > 0 {
@@ -737,7 +759,7 @@ func runSGSPClient(ctx context.Context, cfg config, session sgsp.Session, counte
 		}
 	}()
 	var tick, sequence uint64
-	bulkChunk := max(1, cfg.BulkBytes/100)
+	pacer := bulkPacer{perSecond: cfg.BulkBytes}
 	for {
 		select {
 		case <-ctx.Done():
@@ -760,7 +782,10 @@ func runSGSPClient(ctx context.Context, cfg config, session sgsp.Session, counte
 				counters.requestAccepted.Add(1)
 			}
 		case <-bulk:
-			payload := make([]byte, bulkChunk)
+			payload := make([]byte, pacer.Next())
+			if len(payload) == 0 {
+				continue
+			}
 			counters.bulkOffered.Add(uint64(len(payload)))
 			written, err := stream.Write(payload)
 			if written > 0 {

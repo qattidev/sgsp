@@ -2,6 +2,7 @@ package wire
 
 import (
 	"errors"
+	"io"
 	"unicode/utf8"
 )
 
@@ -49,6 +50,31 @@ func DecodeRequest(src []byte, maxPayload int) (Request, error) {
 	}
 	return Request{MessageType: values[1], TimeoutMS: values[2], Payload: append([]byte(nil), src[used:]...)}, nil
 }
+
+// ReadRequestHeader consumes the request fields after the stream-kind prefix
+// and returns the declared payload length. Callers can reserve that exact
+// payload before allocating or reading it from a reliable stream.
+func ReadRequestHeader(reader io.ByteReader, maxPayload int) (Request, int, error) {
+	if reader == nil || maxPayload < 0 {
+		return Request{}, 0, ErrMalformed
+	}
+	messageType, err := ReadVarint(reader)
+	if err != nil {
+		return Request{}, 0, err
+	}
+	timeoutMS, err := ReadVarint(reader)
+	if err != nil {
+		return Request{}, 0, err
+	}
+	payloadBytes, err := ReadVarint(reader)
+	if err != nil {
+		return Request{}, 0, err
+	}
+	if messageType == 0 || messageType > maxMessageType || timeoutMS == 0 || timeoutMS > 300000 || payloadBytes > uint64(maxPayload) {
+		return Request{}, 0, ErrMalformed
+	}
+	return Request{MessageType: messageType, TimeoutMS: timeoutMS}, int(payloadBytes), nil
+}
 func EncodeResponse(response Response, maxPayload int) ([]byte, error) {
 	if len(response.Payload) > maxPayload {
 		return nil, ErrTooLarge
@@ -79,6 +105,27 @@ func DecodeResponse(src []byte, maxPayload int) (Response, error) {
 		return Response{}, ErrMalformed
 	}
 	return Response{Status: status, Payload: append([]byte(nil), src[n+m:]...)}, nil
+}
+
+// ReadResponseHeader consumes a response status and declared body length
+// without allocating that body. The caller must still validate diagnostic
+// UTF-8 after it reads a non-success payload.
+func ReadResponseHeader(reader io.ByteReader, maxPayload int) (Response, int, error) {
+	if reader == nil || maxPayload < 0 {
+		return Response{}, 0, ErrMalformed
+	}
+	status, err := ReadVarint(reader)
+	if err != nil {
+		return Response{}, 0, err
+	}
+	payloadBytes, err := ReadVarint(reader)
+	if err != nil {
+		return Response{}, 0, err
+	}
+	if payloadBytes > uint64(maxPayload) || (status != 0 && payloadBytes > maxDiagnosticBytes) {
+		return Response{}, 0, ErrMalformed
+	}
+	return Response{Status: status}, int(payloadBytes), nil
 }
 func EncodeCustomStreamHeader(messageType uint64) ([]byte, error) {
 	if messageType == 0 || messageType > maxMessageType {

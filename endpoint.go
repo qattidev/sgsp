@@ -109,6 +109,11 @@ func NewServer(config ServerConfig) (Server, error) {
 }
 
 func (s *serverEndpoint) Owner() Owner { return s.owner }
+func (s *serverEndpoint) observe(name, kind string, code Code, value float64) {
+	if s != nil && s.observer != nil {
+		s.observer.Observe(Observation{Name: name, Kind: kind, Code: code, Value: value})
+	}
+}
 
 func (s *serverEndpoint) armExpiry(session *sessionRecord, expiresAt time.Time) {
 	delay := time.Until(expiresAt)
@@ -432,7 +437,13 @@ func (s *serverEndpoint) handleConnection(connection transport.Conn) {
 		_ = connection.Close(uint64(Unauthenticated), "authentication failed")
 		return
 	}
+	authStarted := time.Now()
 	principal, err := s.config.Auth.Authenticate(ctx, Credential{Scheme: hello.Credential.Scheme, Data: credentialData})
+	authCode := Normal
+	if err != nil || principal.Issuer == "" || principal.Subject == "" || !principal.ExpiresAt.After(time.Now()) {
+		authCode = Unauthenticated
+	}
+	s.observe("auth", histogramKind("verify", time.Since(authStarted)), authCode, 1)
 	if err != nil || principal.Issuer == "" || principal.Subject == "" || !principal.ExpiresAt.After(time.Now()) {
 		_ = connection.Close(uint64(Unauthenticated), "authentication failed")
 		return
@@ -652,9 +663,16 @@ func (s *serverEndpoint) handleRefresh(ctx context.Context, session *sessionReco
 	}
 	refreshCtx, cancel := context.WithTimeout(ctx, s.limits.AuthTimeout)
 	defer cancel()
+	refreshStarted := time.Now()
 	principal, err := s.config.Auth.Authenticate(refreshCtx, Credential{Scheme: message.Credential.Scheme, Data: data})
 	previous := session.Principal()
-	if err != nil || principal.Issuer != previous.Issuer || principal.Subject != previous.Subject || !principal.ExpiresAt.After(time.Now()) {
+	refreshOK := err == nil && principal.Issuer == previous.Issuer && principal.Subject == previous.Subject && principal.ExpiresAt.After(time.Now())
+	refreshCode := Normal
+	if !refreshOK {
+		refreshCode = Unauthenticated
+	}
+	s.observe("auth", histogramKind("refresh", time.Since(refreshStarted)), refreshCode, 1)
+	if !refreshOK {
 		return failure
 	}
 	session.setPrincipal(principal)
@@ -1493,10 +1511,102 @@ func (o *connectionOperations) context() context.Context {
 	return o.session.Context()
 }
 func (o *connectionOperations) current() bool { return o.session.isCurrent(o) }
+
+// protocolViolation closes only a still-active current epoch. An interrupted
+// stream can wake before the server's connection-finish path has canceled its
+// epoch context, so the transport context must also be checked. Ordinary
+// connection loss remains a suspension/reconnect candidate, not malformed
+// application input.
+func (o *connectionOperations) protocolViolation() {
+	if o == nil || o.connection == nil || o.connection.Context().Err() != nil || o.context().Err() != nil || !o.current() {
+		return
+	}
+	o.observe("protocol_errors", "framing", ProtocolViolation, 1)
+	_ = o.session.Close(context.Background(), ProtocolViolation)
+}
+
+// protocolViolationAfterStreamRead gives a concurrently closing transport a
+// bounded chance to publish its cancellation before classifying an interrupted
+// stream as malformed. QUIC can wake a stream read with its application-close
+// error before the connection watcher runs. Treating that error as a framing
+// failure would make an ordinary loss terminal, contrary to the epoch/resume
+// contract. EOF remains an unsolicited FIN and is immediately a violation.
+func (o *connectionOperations) protocolViolationAfterStreamRead(err error) {
+	if err == nil || o == nil || o.connection == nil || errors.Is(err, io.EOF) {
+		o.protocolViolation()
+		return
+	}
+	if o.connection.Context().Err() != nil || o.context().Err() != nil {
+		return
+	}
+	timer := time.NewTimer(50 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-o.connection.Context().Done():
+		return
+	case <-o.context().Done():
+		return
+	case <-timer.C:
+		o.protocolViolation()
+	}
+}
 func (o *connectionOperations) observe(name, kind string, code Code, value float64) {
 	if o != nil && o.observer != nil {
 		o.observer.Observe(Observation{Name: name, Kind: kind, Code: code, Value: value})
 	}
+}
+func (o *connectionOperations) observeDuration(name, kind string, code Code, duration time.Duration) {
+	o.observe(name, histogramKind(kind, duration), code, 1)
+}
+
+// reserveDirectionalBytes accounts for a short-lived library-owned payload
+// allocation against both the session direction and endpoint-wide ledger.
+// The session budget persists across a resume, so a replacement connection
+// cannot temporarily exceed the logical session's directional allowance.
+func (o *connectionOperations) reserveDirectionalBytes(direction *runtime.Budget, bytes int) (func(), error) {
+	if o == nil || bytes < 0 {
+		return nil, ErrBackpressure
+	}
+	if direction != nil && !direction.Acquire(int64(bytes)) {
+		return nil, ErrBackpressure
+	}
+	if o.applicationBudget != nil && !o.applicationBudget.Acquire(int64(bytes)) {
+		if direction != nil {
+			direction.Release(int64(bytes))
+		}
+		return nil, ErrBackpressure
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			if o.applicationBudget != nil {
+				o.applicationBudget.Release(int64(bytes))
+			}
+			if direction != nil {
+				direction.Release(int64(bytes))
+			}
+		})
+	}, nil
+}
+
+// reserveApplicationBytes covers decoded Call replies before their bytes are
+// transferred to application ownership.
+func (o *connectionOperations) reserveApplicationBytes(bytes int) (func(), error) {
+	var direction *runtime.Budget
+	if o != nil && o.session != nil {
+		direction = o.session.incomingBudget
+	}
+	return o.reserveDirectionalBytes(direction, bytes)
+}
+
+// reserveOutgoing covers frames built from caller-owned payloads before the
+// transport has accepted them.
+func (o *connectionOperations) reserveOutgoing(bytes int) (func(), error) {
+	var direction *runtime.Budget
+	if o != nil && o.session != nil {
+		direction = o.session.outgoingBudget
+	}
+	return o.reserveDirectionalBytes(direction, bytes)
 }
 func (o *connectionOperations) dispatch(incoming *Incoming) bool {
 	if !o.current() {
@@ -1800,6 +1910,7 @@ func (o *connectionOperations) invoke(incoming *Incoming) {
 	}
 	defer func() {
 		if recover() != nil {
+			o.observe("handler_panics", "panic", Internal, 1)
 			_ = o.session.Close(context.Background(), Internal)
 		}
 	}()
@@ -1858,6 +1969,11 @@ func (o *connectionOperations) send(ctx context.Context, typ MessageType, payloa
 	if !o.current() {
 		return ErrSessionSuspended
 	}
+	release, err := o.reserveOutgoing(len(payload) + 32)
+	if err != nil {
+		return err
+	}
+	defer release()
 	if options.Delivery == ReliableOrdered {
 		frame, err := wire.EncodeReliableEvent(wire.Event{Channel: uint64(options.Channel), MessageType: uint64(typ), Payload: payload}, o.outboundMessageLimit())
 		if err != nil {
@@ -2076,6 +2192,11 @@ func (o *connectionOperations) call(ctx context.Context, typ MessageType, payloa
 		return nil, ErrResourceExhausted
 	}
 	defer release()
+	releaseOutgoing, err := o.reserveOutgoing(len(payload) + 32)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseOutgoing()
 	timeout := o.session.limits.RequestTimeout
 	if deadline, ok := ctx.Deadline(); ok {
 		if remaining := time.Until(deadline); remaining < timeout {
@@ -2114,27 +2235,73 @@ func (o *connectionOperations) call(ctx context.Context, typ MessageType, payloa
 		response wire.Response
 		err      error
 		complete bool
-	}, 1)
+		release  func()
+	})
 	go func() {
 		defer stream.Close()
-		body, readErr := io.ReadAll(io.LimitReader(stream, int64(o.session.limits.MessageBytes+32)))
-		if readErr != nil {
-			result <- struct {
-				response wire.Response
-				err      error
-				complete bool
-			}{err: readErr}
-			return
-		}
-		response, decodeErr := wire.DecodeResponse(body, o.session.limits.MessageBytes)
-		result <- struct {
+		type responseResult struct {
 			response wire.Response
 			err      error
 			complete bool
-		}{response: response, err: decodeErr, complete: true}
+			release  func()
+		}
+		sendResult := func(value responseResult) {
+			select {
+			case result <- struct {
+				response wire.Response
+				err      error
+				complete bool
+				release  func()
+			}{response: value.response, err: value.err, complete: value.complete, release: value.release}:
+			case <-ctx.Done():
+				if value.release != nil {
+					value.release()
+				}
+			case <-o.context().Done():
+				if value.release != nil {
+					value.release()
+				}
+			}
+		}
+		reader := streamByteReader{Reader: stream}
+		response, payloadBytes, readErr := wire.ReadResponseHeader(reader, o.session.limits.MessageBytes)
+		if readErr != nil {
+			sendResult(responseResult{err: readErr})
+			return
+		}
+		releaseBody, reserveErr := o.reserveApplicationBytes(payloadBytes + 32)
+		if reserveErr != nil {
+			sendResult(responseResult{err: reserveErr})
+			return
+		}
+		response.Payload = make([]byte, payloadBytes)
+		if _, readErr = io.ReadFull(reader, response.Payload); readErr != nil {
+			releaseBody()
+			sendResult(responseResult{err: readErr})
+			return
+		}
+		var trailing [1]byte
+		if count, trailingErr := reader.Read(trailing[:]); count != 0 {
+			releaseBody()
+			sendResult(responseResult{err: wire.ErrMalformed, complete: true})
+			return
+		} else if !errors.Is(trailingErr, io.EOF) {
+			releaseBody()
+			sendResult(responseResult{err: trailingErr})
+			return
+		}
+		if response.Status != 0 && !utf8.Valid(response.Payload) {
+			releaseBody()
+			sendResult(responseResult{err: wire.ErrMalformed, complete: true})
+			return
+		}
+		sendResult(responseResult{response: response, complete: true, release: releaseBody})
 	}()
 	select {
 	case result := <-result:
+		if result.release != nil {
+			defer result.release()
+		}
 		if result.err != nil {
 			if !result.complete {
 				return nil, unknownRequestOutcome(result.err)
@@ -2481,10 +2648,12 @@ func (o *connectionOperations) readReliableStream(stream transport.ReceiveStream
 	reader := streamByteReader{Reader: stream}
 	kind, err := wire.ReadVarint(reader)
 	if err != nil || kind != wire.ReliableEventKind {
+		o.protocolViolationAfterStreamRead(err)
 		return
 	}
 	channel, err := wire.ReadVarint(reader)
 	if err != nil || channel > 1<<16-1 {
+		o.protocolViolationAfterStreamRead(err)
 		return
 	}
 	if !o.bindInbound(ChannelID(channel), ReliableOrdered) {
@@ -2494,13 +2663,16 @@ func (o *connectionOperations) readReliableStream(stream transport.ReceiveStream
 	for {
 		length, err := wire.ReadVarint(reader)
 		if err != nil {
+			o.protocolViolationAfterStreamRead(err)
 			return
 		}
 		if length > uint64(o.session.limits.MessageBytes+32) {
+			o.protocolViolation()
 			return
 		}
 		event, payloadBytes, err := wire.ReadReliableEventHeader(reader, length, o.session.limits.MessageBytes)
 		if err != nil || event.Channel != channel {
+			o.protocolViolationAfterStreamRead(err)
 			return
 		}
 		if !o.allowInboundMessage() {
@@ -2519,6 +2691,7 @@ func (o *connectionOperations) readReliableStream(stream transport.ReceiveStream
 		event.Payload = make([]byte, payloadBytes)
 		if _, err := io.ReadFull(reader, event.Payload); err != nil {
 			reservation.Cancel()
+			o.protocolViolationAfterStreamRead(err)
 			return
 		}
 		if err := o.deliverReservedReliableEvent(event, reservation); err != nil {
@@ -2540,7 +2713,9 @@ func (o *connectionOperations) acceptApplicationStreams() {
 	}
 }
 func (o *connectionOperations) readApplicationStream(stream transport.BidiStream) {
-	reader := bufio.NewReader(stream)
+	// Use an unbuffered header reader so a request body remains unread until
+	// its exact application reservation has been acquired.
+	reader := streamByteReader{Reader: stream}
 	if err := stream.SetDeadline(time.Now().Add(o.session.limits.AuthTimeout)); err != nil {
 		_ = stream.Close()
 		return
@@ -2548,6 +2723,7 @@ func (o *connectionOperations) readApplicationStream(stream transport.BidiStream
 	kind, err := wire.ReadVarint(reader)
 	if err != nil {
 		_ = stream.Close()
+		o.protocolViolationAfterStreamRead(err)
 		return
 	}
 	switch kind {
@@ -2565,11 +2741,12 @@ func (o *connectionOperations) readApplicationStream(stream transport.BidiStream
 			_ = stream.Close()
 			return
 		}
-		o.readRequestStream(stream, reader, kind, release)
+		o.readRequestStream(stream, reader, release)
 	case wire.CustomStreamKind:
 		messageType, err := wire.ReadVarint(reader)
 		if err != nil || messageType == 0 || messageType > 1<<32-1 {
 			_ = stream.Close()
+			o.protocolViolationAfterStreamRead(err)
 			return
 		}
 		if !o.allowInboundMessage() {
@@ -2587,12 +2764,16 @@ func (o *connectionOperations) readApplicationStream(stream transport.BidiStream
 			_ = stream.Close()
 			return
 		}
-		o.readCustomStream(stream, reader, MessageType(messageType), release)
+		o.readCustomStream(stream, bufio.NewReader(stream), MessageType(messageType), release)
 	default:
 		stream.Abort(uint64(ProtocolViolation))
+		o.protocolViolation()
 	}
 }
-func (o *connectionOperations) readRequestStream(stream transport.BidiStream, reader *bufio.Reader, kind uint64, release func()) {
+func (o *connectionOperations) readRequestStream(stream transport.BidiStream, reader interface {
+	io.Reader
+	io.ByteReader
+}, release func()) {
 	var cleanupOnce sync.Once
 	cleanup := func() {
 		cleanupOnce.Do(func() {
@@ -2608,30 +2789,54 @@ func (o *connectionOperations) readRequestStream(stream transport.BidiStream, re
 			cleanup()
 		}
 	}()
-	body, err := io.ReadAll(io.LimitReader(reader, int64(o.session.limits.MessageBytes+31)))
+	request, payloadBytes, err := wire.ReadRequestHeader(reader, o.session.limits.MessageBytes)
 	if err != nil {
+		o.protocolViolationAfterStreamRead(err)
 		return
 	}
-	prefix, _ := wire.AppendVarint(nil, kind)
-	request, err := wire.DecodeRequest(append(prefix, body...), o.session.limits.MessageBytes)
+	pressureCtx, stopPressure := context.WithTimeout(o.context(), o.session.limits.SlowConsumerTimeout)
+	reservation, err := o.reserveReliableIncoming(pressureCtx, payloadBytes+32)
+	stopPressure()
 	if err != nil {
+		if o.context().Err() == nil && o.current() {
+			_ = o.session.Close(context.Background(), SlowConsumer)
+		}
+		return
+	}
+	request.Payload = make([]byte, payloadBytes)
+	if _, err := io.ReadFull(reader, request.Payload); err != nil {
+		reservation.Cancel()
+		o.protocolViolationAfterStreamRead(err)
 		return
 	}
 	requestCtx, cancel := context.WithTimeout(o.context(), time.Duration(request.TimeoutMS)*time.Millisecond)
+	requestStarted := time.Now()
 	completed := make(chan struct{})
 	var completeOnce sync.Once
 	respond := func(ctx context.Context, status Code, payload []byte) error {
+		resultCode := status
+		defer func() { o.observeDuration("requests", "latency", resultCode, time.Since(requestStarted)) }()
 		if err := ctx.Err(); err != nil {
+			resultCode = Internal
 			return err
 		}
+		releaseOutgoing, err := o.reserveOutgoing(len(payload) + 32)
+		if err != nil {
+			resultCode = Backpressure
+			return err
+		}
+		defer releaseOutgoing()
 		frame, err := wire.EncodeResponse(wire.Response{Status: uint64(status), Payload: payload}, o.outboundMessageLimit())
 		if err != nil {
+			resultCode = Internal
 			return mapWireError(err)
 		}
 		if _, err := stream.Write(frame); err != nil {
+			resultCode = Internal
 			return err
 		}
 		if err := stream.CloseWrite(); err != nil {
+			resultCode = Internal
 			return err
 		}
 		completeOnce.Do(func() { close(completed) })
@@ -2642,7 +2847,7 @@ func (o *connectionOperations) readRequestStream(stream transport.BidiStream, re
 		Session: o.session,
 		Epoch:   o.epoch,
 		Type:    MessageType(request.MessageType),
-		Payload: append([]byte(nil), request.Payload...),
+		Payload: request.Payload,
 		ctx:     requestCtx,
 		reply: func(ctx context.Context, payload []byte) error {
 			return respond(ctx, Normal, payload)
@@ -2660,7 +2865,8 @@ func (o *connectionOperations) readRequestStream(stream transport.BidiStream, re
 			cleanup()
 		}
 		handedOff = true
-		if !o.dispatch(incoming) {
+		if err := o.enqueueReservedReliableHandler(incoming, reservation); err != nil {
+			reservation.Cancel()
 			_ = incoming.Fail(context.Background(), Backpressure, "request queue full")
 			incoming.Release()
 		}
@@ -2668,7 +2874,7 @@ func (o *connectionOperations) readRequestStream(stream transport.BidiStream, re
 	}
 	defer cancel()
 	defer incoming.Release()
-	if !o.dispatch(incoming) {
+	if !reservation.Commit(incoming) {
 		_ = incoming.Fail(context.Background(), Backpressure, "request queue full")
 		return
 	}

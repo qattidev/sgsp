@@ -7,16 +7,17 @@ streams, polling dispatch, and bounded fixed-worker handler dispatch (with
 per-session serialization and queued sequenced-update coalescing), logical close acknowledgement,
 reconnect/resume, bounded terminal-ID and group-tombstone retention, placement
 interfaces, memory and PostgreSQL adapters with an explicit migration runner,
-one-second bounded observer aggregation for session and two-way event-message signals,
+one-second bounded observer aggregation for session, two-way event-message, and selected error signals,
 and the direct/bootstrap action example with a 128 Hz authoritative loop.
 
-Verified on 2026-09-14:
+Verified on 2026-09-15:
 
 ```text
 GOCACHE=/tmp/sgsp-go-build go test -count=1 ./...        PASS
 GOCACHE=/tmp/sgsp-go-build go test -race -count=1 ./...  PASS
 GOCACHE=/tmp/sgsp-go-build go test -race -count=20 \
   -run 'Test(ConcurrentAssignment|AssignmentVersionAndClose)$' ./placement/...  PASS
+GOCACHE=/tmp/sgsp-go-build go test -race -count=10 ./cmd/sgspbench            PASS
 ```
 
 The action example has automated local-QUIC direct and bootstrap coverage:
@@ -30,24 +31,33 @@ reported as passed:
 
 - complete aggregate application-budget accounting (outgoing/stream buffers),
   reserved reply/control queue capacity, and the remaining rate-limit behavior
-  from section 10. Reliable stream readers now reserve queue and global-body
-  capacity before consuming a declared payload; both dispatch modes wait
-  through `SlowConsumerTimeout` for queued reliable work and then close, but
-  this does not complete the full gate;
+  from section 10. Reliable event and request stream readers now reserve queue
+  and global-body capacity before consuming a declared payload, and `Call`
+  response bodies reserve global capacity before allocation. Short-lived
+  outbound frames and decoded `Call` bodies also reserve their separate,
+  resume-persistent per-session directional `QueueBytes` budgets. Both
+  dispatch modes wait through `SlowConsumerTimeout` for queued reliable work
+  and then close, but this does not complete the full gate;
 - broader terminal cleanup coverage from section 8. Barrier-driven
   100-candidate concurrent commit, real lost-WELCOME retry with an unseen
   epoch, pre-grace resume/post-grace expiry, a real-QUIC polling epoch-queue
-  cleanup test, and bounded expired-ID cache tests are present;
+  cleanup test, a real-QUIC pending request/custom-stream loss cleanup test,
+  interrupted reliable-stream loss handoff (which must not be relabeled as a
+  protocol violation), and bounded expired-ID cache tests are present;
 - PostgreSQL integration execution against a disposable service; the explicit
   migration runner and its local integrity checks compile, but no service was
   available here;
-- full section-11 observation coverage: fixed histogram buckets and the
-  remaining authentication, queue, request, stream, placement, and transport
-  signals are not yet instrumented;
-- the M8 workload engine, impairment matrix, and published performance trial
-  results. A bounded deterministic two-socket UDP relay now exists for tests,
-  but `cmd/sgspbench` still writes an explicit incomplete result and exits
-  nonzero until it drives and records the required measurements.
+- full section-11 observation coverage: fixed duration histogram buckets plus
+  selected authentication/request latency and error signals are present, but
+  queue, remaining request, stream, placement, and transport signals are not
+  yet instrumented;
+- the M8 impairment matrix and published performance trial results.
+  `cmd/sgspbench` now runs a bounded single SGSP or bare-QUIC trial through
+  per-client deterministic two-socket UDP relays, exercising sequenced
+  input/update datagrams, request/reply, and paced raw-stream bulk data. It
+  records configuration, operation counts, relay state, and Go runtime data,
+  but the required five-trial matrix, plateau campaign, and published report
+  remain incomplete.
 
 The UDP receive-buffer warning emitted by quic-go on this host (416 KiB versus
 its 7 MiB desired buffer) is environmental and remains recorded as a

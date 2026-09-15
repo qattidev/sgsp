@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"qattidev/sgsp/internal/runtime"
 )
 
 // sessionOperations is the private seam between the concurrency-safe public
@@ -20,29 +22,34 @@ type sessionOperations interface {
 }
 
 type sessionRecord struct {
-	mu          sync.RWMutex
-	id          SessionID
-	owner       Owner
-	group       string
-	principal   Principal
-	ctx         context.Context
-	cancel      context.CancelFunc
-	state       State
-	epoch       uint64
-	attachment  any
-	limits      Limits
-	clientSide  bool
-	operations  sessionOperations
-	resumeHash  [32]byte
-	peerLimits  limitMessage
-	terminal    Code
-	expiryTimer *time.Timer
-	graceTimer  *time.Timer
+	mu         sync.RWMutex
+	id         SessionID
+	owner      Owner
+	group      string
+	principal  Principal
+	ctx        context.Context
+	cancel     context.CancelFunc
+	state      State
+	epoch      uint64
+	attachment any
+	limits     Limits
+	clientSide bool
+	operations sessionOperations
+	resumeHash [32]byte
+	peerLimits limitMessage
+	terminal   Code
+	// Directional budgets persist across resumed connections. They cover
+	// temporary library-owned frames and reply bodies; queued incoming work is
+	// additionally charged by its dispatch queue.
+	incomingBudget *runtime.Budget
+	outgoingBudget *runtime.Budget
+	expiryTimer    *time.Timer
+	graceTimer     *time.Timer
 }
 
 func newSessionRecord(id SessionID, owner Owner, group string, principal Principal, limits Limits, clientSide bool, operations sessionOperations) *sessionRecord {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &sessionRecord{id: id, owner: owner, group: group, principal: copyPrincipal(principal), ctx: ctx, cancel: cancel, state: Active, epoch: 1, limits: limits, clientSide: clientSide, operations: operations}
+	return &sessionRecord{id: id, owner: owner, group: group, principal: copyPrincipal(principal), ctx: ctx, cancel: cancel, state: Active, epoch: 1, limits: limits, clientSide: clientSide, operations: operations, incomingBudget: runtime.NewBudget(int64(limits.QueueBytes)), outgoingBudget: runtime.NewBudget(int64(limits.QueueBytes))}
 }
 
 func copyPrincipal(principal Principal) Principal {
@@ -96,7 +103,10 @@ func (s *sessionRecord) send(ctx context.Context, typ MessageType, payload []byt
 	if state != Active || operations == nil {
 		return ErrSessionClosed
 	}
-	return operations.send(ctx, typ, append([]byte(nil), payload...), options)
+	// Admitted transport operations copy or frame payload while this call is in
+	// flight. Keeping the caller's slice here lets that layer reserve its
+	// application-budget charge before allocating the encoded outgoing frame.
+	return operations.send(ctx, typ, payload, options)
 }
 func (s *sessionRecord) Call(ctx context.Context, typ MessageType, payload []byte) ([]byte, error) {
 	if typ == 0 || len(payload) > s.outboundMessageLimit() {
@@ -111,7 +121,7 @@ func (s *sessionRecord) Call(ctx context.Context, typ MessageType, payload []byt
 	if state != Active || operations == nil {
 		return nil, ErrSessionClosed
 	}
-	result, err := operations.call(ctx, typ, append([]byte(nil), payload...))
+	result, err := operations.call(ctx, typ, payload)
 	return append([]byte(nil), result...), err
 }
 

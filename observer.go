@@ -2,6 +2,7 @@ package sgsp
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,6 +26,28 @@ type observerQueue struct {
 type observationKey struct {
 	name, kind string
 	code       Code
+}
+
+// histogramKind uses the fixed duration buckets required by the architecture:
+// powers of two from one microsecond through 524288 microseconds, a one
+// second bucket, and an overflow. The generated suffix is bounded and never
+// incorporates host or application-controlled data.
+func histogramKind(kind string, duration time.Duration) string {
+	if kind == "" {
+		kind = "duration"
+	}
+	if duration < 0 {
+		duration = 0
+	}
+	for bucket := int64(1); bucket <= 524_288; bucket <<= 1 {
+		if duration <= time.Duration(bucket)*time.Microsecond {
+			return kind + "_le_" + strconv.FormatInt(bucket, 10) + "us"
+		}
+	}
+	if duration <= time.Second {
+		return kind + "_le_1s"
+	}
+	return kind + "_overflow"
 }
 
 func newObserverQueue(observer Observer, capacity int, interval time.Duration) *observerQueue {
