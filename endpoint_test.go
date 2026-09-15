@@ -14,6 +14,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	goruntime "runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1487,6 +1488,62 @@ func TestClientReconnectLoop(t *testing.T) {
 	}
 }
 
+func TestSessionAdmissionLimit(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits := DefaultLimits()
+	limits.MaxSessions = 1
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Limits: limits, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	clientConfig := ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}}
+	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, clientConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, clientConfig); !errors.Is(err, ErrResourceExhausted) {
+		t.Fatalf("new session at capacity = %v, want ResourceExhausted", err)
+	}
+	concrete := client.(*clientEndpoint)
+	concrete.mu.Lock()
+	concrete.reconnecting = true // The explicit resume supersedes this transport.
+	concrete.mu.Unlock()
+	attachment, err := concrete.openResume(ctx)
+	if err != nil {
+		t.Fatalf("resume at session capacity = %v", err)
+	}
+	if err := concrete.attachResume(attachment); err != nil {
+		t.Fatalf("attach at session capacity = %v", err)
+	}
+	concrete.mu.Lock()
+	concrete.reconnecting = false
+	concrete.mu.Unlock()
+	waitForSessionState(t, ctx, concrete.session, Active, 2)
+	sessions := endpoint.Sessions()
+	if len(sessions) != 1 || sessions[0].Epoch() != 2 {
+		t.Fatalf("resume at capacity sessions = %#v", sessions)
+	}
+	_ = client.Close(context.Background())
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLostResumeWelcome(t *testing.T) {
 	certificate, roots := endpointCertificate(t)
 	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -1719,6 +1776,131 @@ func TestEpochFence(t *testing.T) {
 		t.Fatalf("current epoch polling item = %#v", current)
 	}
 	current.Release()
+	_ = client.Close(context.Background())
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEpochFenceRejectsOldReplyAndStream(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestStarted := make(chan *Incoming, 1)
+	streamStarted := make(chan *Incoming, 1)
+	releaseRequest := make(chan struct{})
+	releaseStream := make(chan struct{})
+	replyResult := make(chan error, 1)
+	streamResult := make(chan error, 1)
+	router := NewRouter()
+	if err := router.OnRequest(96, func(_ context.Context, incoming *Incoming) {
+		requestStarted <- incoming
+		<-releaseRequest
+		replyResult <- incoming.Reply(context.Background(), []byte("stale reply"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.OnStream(97, func(_ context.Context, incoming *Incoming) {
+		streamStarted <- incoming
+		<-releaseStream
+		_, err := incoming.Stream.Write([]byte("stale stream"))
+		streamResult <- err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Dispatch: DispatchConfig{Mode: Handlers, Router: router}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	concrete := client.(*clientEndpoint)
+	concrete.mu.Lock()
+	concrete.reconnecting = true // The test commits the replacement epoch itself.
+	concrete.mu.Unlock()
+	stream, err := client.Session().OpenStream(ctx, 97)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-streamStarted:
+	case <-ctx.Done():
+		t.Fatal("custom stream did not reach server")
+	}
+	callDone := make(chan error, 1)
+	go func() {
+		_, err := client.Session().Call(ctx, 96, []byte("operation"))
+		callDone <- err
+	}()
+	select {
+	case <-requestStarted:
+	case <-ctx.Done():
+		t.Fatal("request did not reach server")
+	}
+	serverSession := endpoint.Sessions()[0].(*sessionRecord)
+	if err := closeCurrentTransport(serverSession, "fence old application work"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-callDone:
+		var outcome *Error
+		if !errors.As(err, &outcome) || !outcome.OutcomeUnknown {
+			t.Fatalf("lost old-epoch call = %v, want OutcomeUnknown", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("old-epoch call did not unblock")
+	}
+	waitForSessionState(t, ctx, concrete.session, Suspended, 1)
+	waitForSessionState(t, ctx, serverSession, Suspended, 1)
+	attachment, err := concrete.openResume(ctx)
+	if err != nil {
+		t.Fatalf("resume for epoch fence = %v", err)
+	}
+	if err := concrete.attachResume(attachment); err != nil {
+		t.Fatalf("attach for epoch fence = %v", err)
+	}
+	concrete.mu.Lock()
+	concrete.reconnecting = false
+	concrete.mu.Unlock()
+	waitForSessionState(t, ctx, concrete.session, Active, 2)
+	waitForSessionState(t, ctx, serverSession, Active, 2)
+	if _, err := stream.Write([]byte("stale client stream")); !errors.Is(err, ErrSessionSuperseded) {
+		t.Fatalf("old client stream write = %v, want SessionSuperseded", err)
+	}
+	close(releaseRequest)
+	close(releaseStream)
+	select {
+	case err := <-replyResult:
+		if !errors.Is(err, ErrSessionSuperseded) {
+			t.Fatalf("old server reply = %v, want SessionSuperseded", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("old request handler did not return")
+	}
+	select {
+	case err := <-streamResult:
+		if !errors.Is(err, ErrSessionSuperseded) {
+			t.Fatalf("old server stream write = %v, want SessionSuperseded", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("old stream handler did not return")
+	}
+	_ = stream.Close()
 	_ = client.Close(context.Background())
 	stop()
 	if err := <-serveDone; err != nil {
@@ -2530,7 +2712,129 @@ func TestDraining(t *testing.T) {
 	}
 }
 
-func TestReliableRateLimit(t *testing.T) {
+func TestShutdownCleanup(t *testing.T) {
+	const cycles = 1_000
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits := DefaultLimits()
+	// The stress loop deliberately creates a fresh admission and resume from
+	// one local source per cycle; avoid making the source-IP limiter the thing
+	// under test here.
+	limits.HandshakesPerIPPerSecond = 100_000
+	limits.HandshakeBurstPerIP = 100_000
+	router := NewRouter()
+	if err := router.OnRequest(98, func(ctx context.Context, incoming *Incoming) {
+		_ = incoming.Reply(ctx, []byte("ok"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Limits: limits, Dispatch: DispatchConfig{Mode: Handlers, Router: router}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	stopped := false
+	t.Cleanup(func() {
+		if !stopped {
+			stop()
+			<-serveDone
+		}
+	})
+	config := ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}}
+	call := func(ctx context.Context, session Session) {
+		t.Helper()
+		response, err := session.Call(ctx, 98, []byte("request"))
+		if err != nil || string(response) != "ok" {
+			t.Fatalf("request response = %q, %v", response, err)
+		}
+	}
+	waitForNoSessions := func(ctx context.Context) {
+		t.Helper()
+		for len(endpoint.Sessions()) != 0 {
+			select {
+			case <-endpoint.changed:
+			case <-ctx.Done():
+				t.Fatalf("sessions remained after close: %v", ctx.Err())
+			}
+		}
+	}
+	runCycle := func(index int) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, config)
+		if err != nil {
+			t.Fatalf("cycle %d Dial: %v", index, err)
+		}
+		concrete := client.(*clientEndpoint)
+		call(ctx, client.Session())
+		concrete.mu.Lock()
+		concrete.reconnecting = true // Drive the resume below without a jitter race.
+		concrete.mu.Unlock()
+		sessions := endpoint.Sessions()
+		if len(sessions) != 1 {
+			t.Fatalf("cycle %d server sessions = %d, want 1", index, len(sessions))
+		}
+		serverSession := sessions[0].(*sessionRecord)
+		if err := closeCurrentTransport(serverSession, "shutdown cleanup transport loss"); err != nil {
+			t.Fatalf("cycle %d transport loss: %v", index, err)
+		}
+		waitForSessionState(t, ctx, concrete.session, Suspended, 1)
+		waitForSessionState(t, ctx, serverSession, Suspended, 1)
+		attachment, err := concrete.openResume(ctx)
+		if err != nil {
+			t.Fatalf("cycle %d resume: %v", index, err)
+		}
+		if err := concrete.attachResume(attachment); err != nil {
+			t.Fatalf("cycle %d attach resume: %v", index, err)
+		}
+		concrete.mu.Lock()
+		concrete.reconnecting = false
+		concrete.mu.Unlock()
+		waitForSessionState(t, ctx, concrete.session, Active, 2)
+		waitForSessionState(t, ctx, serverSession, Active, 2)
+		call(ctx, client.Session())
+		if err := client.Close(ctx); err != nil {
+			t.Fatalf("cycle %d Close: %v", index, err)
+		}
+		waitForNoSessions(ctx)
+		if used := endpoint.applicationBudget.Used(); used != 0 {
+			t.Fatalf("cycle %d server application budget retained %d bytes", index, used)
+		}
+	}
+
+	// Establish the warmed baseline after a complete cycle, then ensure that
+	// 999 more cycles do not retain endpoint work or material heap growth.
+	runCycle(0)
+	goruntime.GC()
+	var baseline goruntime.MemStats
+	goruntime.ReadMemStats(&baseline)
+	for index := 1; index < cycles; index++ {
+		runCycle(index)
+	}
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+	stopped = true
+	goruntime.GC()
+	var after goruntime.MemStats
+	goruntime.ReadMemStats(&after)
+	if after.HeapAlloc > baseline.HeapAlloc+2<<20 {
+		t.Fatalf("heap retained after %d cleanup cycles: baseline=%d after=%d", cycles, baseline.HeapAlloc, after.HeapAlloc)
+	}
+}
+
+func TestAdmissionAndRateLimits(t *testing.T) {
 	certificate, roots := endpointCertificate(t)
 	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {

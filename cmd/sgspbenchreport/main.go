@@ -34,11 +34,45 @@ type operationCounts struct {
 }
 
 type measurement struct {
-	Duration time.Duration   `json:"duration"`
-	Inputs   operationCounts `json:"inputs"`
-	Updates  operationCounts `json:"updates"`
-	Requests operationCounts `json:"requests"`
-	Bulk     operationCounts `json:"bulk"`
+	Duration time.Duration      `json:"duration"`
+	Inputs   operationCounts    `json:"inputs"`
+	Updates  operationCounts    `json:"updates"`
+	Requests operationCounts    `json:"requests"`
+	Bulk     operationCounts    `json:"bulk"`
+	Timing   timingMeasurement  `json:"timing"`
+	Relay    relayMeasurement   `json:"relay"`
+	Runtime  runtimeMeasurement `json:"runtime"`
+}
+
+type durationSummary struct {
+	Samples       uint64        `json:"samples"`
+	P50UpperBound time.Duration `json:"p50_upper_bound"`
+	P95UpperBound time.Duration `json:"p95_upper_bound"`
+	P99UpperBound time.Duration `json:"p99_upper_bound"`
+	MaxUpperBound time.Duration `json:"max_upper_bound"`
+}
+
+type timingMeasurement struct {
+	InputSendOverhead durationSummary `json:"input_send_overhead"`
+	RequestRoundTrip  durationSummary `json:"request_round_trip"`
+	UpdateAge         durationSummary `json:"update_age"`
+}
+
+type relayMeasurement struct {
+	Forwarded      uint64 `json:"forwarded"`
+	Dropped        uint64 `json:"dropped"`
+	PendingPackets uint64 `json:"pending_packets"`
+	PendingBytes   int64  `json:"pending_bytes"`
+	Overloaded     bool   `json:"overloaded"`
+}
+
+type runtimeMeasurement struct {
+	Goroutines int     `json:"goroutines"`
+	HeapAlloc  uint64  `json:"heap_alloc"`
+	RSSBytes   uint64  `json:"rss_bytes"`
+	CPUSeconds float64 `json:"cpu_seconds"`
+	TotalAlloc uint64  `json:"allocated_bytes"`
+	Mallocs    uint64  `json:"allocations"`
 }
 
 type trialResult struct {
@@ -137,10 +171,10 @@ func renderReport(trials []trialResult) string {
 	var report strings.Builder
 	report.WriteString("# SGSP benchmark trial index\n\n")
 	fmt.Fprintf(&report, "Generated from %d recorded trial(s): %d completed, %d non-completed. This is an index of measurements, not a release-gate verdict.\n\n", len(trials), completed, failed)
-	report.WriteString("| implementation | clients | Hz | RTT | loss | jitter / reorder | seed | status | inputs offered / accepted / delivered | updates offered / accepted / delivered | requests offered / accepted / delivered / failed | bulk offered / accepted / delivered | artifact |\n")
-	report.WriteString("| --- | ---: | ---: | --- | ---: | --- | ---: | --- | --- | --- | --- | --- | --- |\n")
+	report.WriteString("| implementation | clients | Hz | RTT | loss | jitter / reorder | seed | status | inputs offered / accepted / delivered | updates offered / accepted / delivered | requests offered / accepted / delivered / failed | bulk offered / accepted / delivered | input-send p99 | request RTT p99 | update-age p99 | relay | runtime interval | artifact |\n")
+	report.WriteString("| --- | ---: | ---: | --- | ---: | --- | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
 	for _, trial := range trials {
-		fmt.Fprintf(&report, "| %s | %d | %d | %s | %.2f%% | %s / %.2f%% | %d | %s | %s | %s | %s | %s | `%s` |\n",
+		fmt.Fprintf(&report, "| %s | %d | %d | %s | %.2f%% | %s / %.2f%% | %d | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | `%s` |\n",
 			trial.Config.Implementation,
 			trial.Config.Clients,
 			trial.Config.Hz,
@@ -154,6 +188,11 @@ func renderReport(trials []trialResult) string {
 			formatCounts(trial.Measurement.Updates),
 			formatCountsWithFailure(trial.Measurement.Requests),
 			formatCounts(trial.Measurement.Bulk),
+			formatP99(trial.Measurement.Timing.InputSendOverhead),
+			formatP99(trial.Measurement.Timing.RequestRoundTrip),
+			formatP99(trial.Measurement.Timing.UpdateAge),
+			formatRelay(trial.Measurement.Relay),
+			formatRuntime(trial.Measurement.Runtime),
 			filepath.ToSlash(trial.Path),
 		)
 		if trial.Error != "" {
@@ -169,6 +208,27 @@ func formatCounts(counts operationCounts) string {
 
 func formatCountsWithFailure(counts operationCounts) string {
 	return fmt.Sprintf("%d / %d / %d / %d", counts.Offered, counts.Accepted, counts.Delivered, counts.Failed)
+}
+
+func formatP99(summary durationSummary) string {
+	if summary.Samples == 0 {
+		return "-"
+	}
+	return "≤ " + summary.P99UpperBound.String()
+}
+
+func formatRelay(relay relayMeasurement) string {
+	if relay.Forwarded == 0 && relay.Dropped == 0 && relay.PendingPackets == 0 && relay.PendingBytes == 0 && !relay.Overloaded {
+		return "-"
+	}
+	return fmt.Sprintf("forwarded=%d; dropped=%d; pending=%d/%dB; overloaded=%t", relay.Forwarded, relay.Dropped, relay.PendingPackets, relay.PendingBytes, relay.Overloaded)
+}
+
+func formatRuntime(runtime runtimeMeasurement) string {
+	if runtime.Goroutines == 0 && runtime.HeapAlloc == 0 && runtime.RSSBytes == 0 && runtime.CPUSeconds == 0 && runtime.TotalAlloc == 0 && runtime.Mallocs == 0 {
+		return "-"
+	}
+	return fmt.Sprintf("cpu=%.3fs; heap=%dB; rss=%dB; alloc=%dB/%d; goroutines=%d", runtime.CPUSeconds, runtime.HeapAlloc, runtime.RSSBytes, runtime.TotalAlloc, runtime.Mallocs, runtime.Goroutines)
 }
 
 func sanitizeCell(value string) string {

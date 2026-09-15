@@ -82,3 +82,29 @@ func TestTerminalIDCacheDistinguishesExpiredSessions(t *testing.T) {
 		t.Fatalf("expired terminal cache code = %v", code)
 	}
 }
+
+func TestTerminalIDCacheIsBounded(t *testing.T) {
+	now := time.Now()
+	server := &serverEndpoint{
+		limits:      Limits{MaxSessions: 2},
+		terminals:   make(map[SessionID]terminalSession),
+		terminalTTL: time.Hour,
+	}
+	defer server.stopTerminalTimer()
+	for index := 1; index <= 4; index++ {
+		server.terminals[SessionID{byte(index)}] = terminalSession{code: SessionExpired, expires: now.Add(time.Duration(index) * time.Minute)}
+	}
+	newID := SessionID{5}
+	server.mu.Lock()
+	server.recordTerminalLocked(newID, SessionExpired)
+	server.mu.Unlock()
+	if got, want := len(server.terminals), 2*server.limits.MaxSessions; got != want {
+		t.Fatalf("terminal cache entries = %d, want %d", got, want)
+	}
+	if _, retained := server.terminals[SessionID{1}]; retained {
+		t.Fatal("terminal cache retained its earliest expiry after reaching capacity")
+	}
+	if _, retained := server.terminals[newID]; !retained {
+		t.Fatal("terminal cache did not retain newest terminal ID")
+	}
+}

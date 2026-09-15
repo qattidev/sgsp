@@ -4,6 +4,28 @@
 matrix using separately built binaries. It writes one JSON result per trial,
 an `environment.txt` manifest, and a generated `summary.md` index.
 
+Each trial also records fixed-memory binary-histogram timing summaries. They
+include the local input-send API-call duration, successful request round trip,
+and same-process input-to-update delivery age. Percentiles are reported as
+explicit upper bounds, not exact samples; the histogram never retains one
+entry per operation. Input/send timing and update age are distinct measures,
+so transport transit is not misrepresented as local API overhead.
+
+The JSON and report also retain relay forwarding/backlog state plus interval
+CPU time, live heap/RSS, allocation, and goroutine data. On Linux CPU time is
+user plus system process time; on other platforms a zero value means that this
+dependency-free collector is unavailable.
+
+Run the separate codec microbenchmark independently of transport trials:
+
+```sh
+go test -run '^$' -bench '^BenchmarkCodec' -benchmem .
+```
+
+`BenchmarkCodecRawBytes` is the pre-encoded payload path, while
+`BenchmarkCodecJSON` is the public `sgsp.JSON` encode/decode path. Neither
+result is added to a transport-overhead percentile.
+
 Run it on the reference host, not on a development laptop or a constrained
 CI runner:
 

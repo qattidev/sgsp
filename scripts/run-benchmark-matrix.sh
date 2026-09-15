@@ -38,6 +38,7 @@ mkdir -p "$bin_dir" "$raw_dir"
 {
   echo "timestamp_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "gomaxprocs=$gomaxprocs"
+  echo "build_flags=-trimpath"
   echo "go_version=$(go version)"
   echo "go_env=$(go env GOOS GOARCH GOVERSION)"
   echo "kernel=$(uname -sr)"

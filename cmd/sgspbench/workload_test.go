@@ -3,9 +3,47 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
+
+func TestCountWorkloadFailureExcludesMeasurementCutoff(t *testing.T) {
+	if !countWorkloadFailure(context.Background(), errors.New("write failed")) {
+		t.Fatal("live workload failure was not counted")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if countWorkloadFailure(ctx, context.Canceled) {
+		t.Fatal("cutoff cancellation was counted as a workload failure")
+	}
+}
+
+func TestDurationHistogramUsesBoundedUpperBounds(t *testing.T) {
+	histogram := &durationHistogram{}
+	histogram.Record(time.Nanosecond)
+	histogram.Record(2 * time.Nanosecond)
+	histogram.Record(2 * time.Millisecond)
+	summary := histogram.Snapshot()
+	if summary.Samples != 3 || summary.P50UpperBound < 2*time.Nanosecond || summary.P99UpperBound < 2*time.Millisecond || summary.MaxUpperBound < 2*time.Millisecond {
+		t.Fatalf("histogram summary = %#v", summary)
+	}
+	histogram.Reset()
+	if summary := histogram.Snapshot(); summary.Samples != 0 {
+		t.Fatalf("histogram retained samples after reset: %#v", summary)
+	}
+}
+
+func TestBenchmarkPayloadPreservesClockStamp(t *testing.T) {
+	payload := benchmarkPayload(24, 7, 9, 11)
+	tick, sequence, stamp, ok := benchmarkPayloadFields(payload)
+	if !ok || tick != 7 || sequence != 9 || stamp != 11 {
+		t.Fatalf("benchmark payload fields = %d/%d/%d/%t", tick, sequence, stamp, ok)
+	}
+	if _, _, _, ok := benchmarkPayloadFields(payload[:23]); ok {
+		t.Fatal("truncated benchmark payload exposed a timestamp")
+	}
+}
 
 func TestRunSGSPTrial(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -22,6 +60,9 @@ func TestRunSGSPTrial(t *testing.T) {
 	}
 	if measurement.Relay.Overloaded {
 		t.Fatal("short trial overloaded relay")
+	}
+	if measurement.Timing.InputSendOverhead.Samples == 0 || measurement.Timing.UpdateAge.Samples == 0 {
+		t.Fatalf("timing measurement = %#v", measurement.Timing)
 	}
 }
 
@@ -41,6 +82,9 @@ func TestRunQUICTrial(t *testing.T) {
 	if measurement.Relay.Overloaded {
 		t.Fatal("short trial overloaded relay")
 	}
+	if measurement.Timing.InputSendOverhead.Samples == 0 || measurement.Timing.UpdateAge.Samples == 0 {
+		t.Fatalf("timing measurement = %#v", measurement.Timing)
+	}
 }
 
 func TestTrialRequestsAndBulk(t *testing.T) {
@@ -57,6 +101,9 @@ func TestTrialRequestsAndBulk(t *testing.T) {
 			}
 			if measurement.Bulk.Offered == 0 || measurement.Bulk.Accepted == 0 || measurement.Bulk.Delivered == 0 {
 				t.Fatalf("bulk measurement = %#v", measurement.Bulk)
+			}
+			if measurement.Timing.RequestRoundTrip.Samples == 0 {
+				t.Fatalf("request timing measurement = %#v", measurement.Timing)
 			}
 		})
 	}
@@ -84,10 +131,10 @@ func TestBulkPacerPreservesConfiguredRate(t *testing.T) {
 }
 
 func TestRuntimeDeltaUsesIntervalAllocationCounters(t *testing.T) {
-	start := runtimeMeasurement{TotalAlloc: 100, Mallocs: 40}
-	end := runtimeMeasurement{HeapAlloc: 50, RSSBytes: 70, TotalAlloc: 125, Mallocs: 49}
+	start := runtimeMeasurement{CPUSeconds: 1.25, TotalAlloc: 100, Mallocs: 40}
+	end := runtimeMeasurement{HeapAlloc: 50, RSSBytes: 70, CPUSeconds: 2, TotalAlloc: 125, Mallocs: 49}
 	got := runtimeDelta(start, end)
-	if got.HeapAlloc != 50 || got.RSSBytes != 70 || got.TotalAlloc != 25 || got.Mallocs != 9 {
+	if got.HeapAlloc != 50 || got.RSSBytes != 70 || got.CPUSeconds != 0.75 || got.TotalAlloc != 25 || got.Mallocs != 9 {
 		t.Fatalf("runtime delta = %#v", got)
 	}
 }

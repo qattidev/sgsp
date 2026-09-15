@@ -12,6 +12,7 @@ import (
 	"errors"
 	"io"
 	"math/big"
+	"math/bits"
 	"net"
 	"os"
 	"runtime"
@@ -42,6 +43,7 @@ type measurement struct {
 	Updates  operationCounts    `json:"updates"`
 	Requests operationCounts    `json:"requests"`
 	Bulk     operationCounts    `json:"bulk"`
+	Timing   timingMeasurement  `json:"timing"`
 	Relay    relayMeasurement   `json:"relay"`
 	Runtime  runtimeMeasurement `json:"runtime"`
 }
@@ -62,15 +64,104 @@ type relayMeasurement struct {
 }
 
 type runtimeMeasurement struct {
-	GoMaxProcs      int    `json:"gomaxprocs"`
-	Goroutines      int    `json:"goroutines"`
-	HeapAlloc       uint64 `json:"heap_alloc"`
-	RSSBytes        uint64 `json:"rss_bytes"`
-	TotalAlloc      uint64 `json:"allocated_bytes"`
-	Mallocs         uint64 `json:"allocations"`
-	NumCPU          int    `json:"num_cpu"`
-	OperatingSystem string `json:"operating_system"`
-	Architecture    string `json:"architecture"`
+	GoMaxProcs      int     `json:"gomaxprocs"`
+	Goroutines      int     `json:"goroutines"`
+	HeapAlloc       uint64  `json:"heap_alloc"`
+	RSSBytes        uint64  `json:"rss_bytes"`
+	CPUSeconds      float64 `json:"cpu_seconds"`
+	TotalAlloc      uint64  `json:"allocated_bytes"`
+	Mallocs         uint64  `json:"allocations"`
+	NumCPU          int     `json:"num_cpu"`
+	OperatingSystem string  `json:"operating_system"`
+	Architecture    string  `json:"architecture"`
+}
+
+// durationSummary reports upper bounds from a fixed binary histogram. Keeping
+// the samples in fixed buckets makes long trials bounded independently of the
+// offered workload while retaining enough resolution to evaluate a 1 ms gate.
+type durationSummary struct {
+	Samples       uint64        `json:"samples"`
+	P50UpperBound time.Duration `json:"p50_upper_bound"`
+	P95UpperBound time.Duration `json:"p95_upper_bound"`
+	P99UpperBound time.Duration `json:"p99_upper_bound"`
+	MaxUpperBound time.Duration `json:"max_upper_bound"`
+}
+
+type timingMeasurement struct {
+	InputSendOverhead durationSummary `json:"input_send_overhead"`
+	RequestRoundTrip  durationSummary `json:"request_round_trip"`
+	UpdateAge         durationSummary `json:"update_age"`
+}
+
+const durationHistogramBuckets = 64
+
+type durationHistogram struct {
+	buckets [durationHistogramBuckets]atomic.Uint64
+}
+
+func (h *durationHistogram) Record(value time.Duration) {
+	if h == nil || value < 0 {
+		return
+	}
+	bucket := 0
+	if value > 0 {
+		bucket = bits.Len64(uint64(value))
+	}
+	if bucket >= len(h.buckets) {
+		bucket = len(h.buckets) - 1
+	}
+	h.buckets[bucket].Add(1)
+}
+
+func (h *durationHistogram) Reset() {
+	if h == nil {
+		return
+	}
+	for index := range h.buckets {
+		h.buckets[index].Store(0)
+	}
+}
+
+func (h *durationHistogram) Snapshot() durationSummary {
+	if h == nil {
+		return durationSummary{}
+	}
+	var total uint64
+	for index := range h.buckets {
+		total += h.buckets[index].Load()
+	}
+	if total == 0 {
+		return durationSummary{}
+	}
+	quantile := func(numerator, denominator uint64) time.Duration {
+		target := (total*numerator + denominator - 1) / denominator
+		var seen uint64
+		for index := range h.buckets {
+			seen += h.buckets[index].Load()
+			if seen >= target {
+				return durationBucketUpperBound(index)
+			}
+		}
+		return durationBucketUpperBound(len(h.buckets) - 1)
+	}
+	max := time.Duration(0)
+	for index := len(h.buckets) - 1; index >= 0; index-- {
+		if h.buckets[index].Load() > 0 {
+			max = durationBucketUpperBound(index)
+			break
+		}
+	}
+	return durationSummary{Samples: total, P50UpperBound: quantile(50, 100), P95UpperBound: quantile(95, 100), P99UpperBound: quantile(99, 100), MaxUpperBound: max}
+}
+
+func durationBucketUpperBound(bucket int) time.Duration {
+	if bucket <= 0 {
+		return 0
+	}
+	if bucket >= 63 {
+		return time.Duration(1<<63 - 1)
+	}
+	return time.Duration(1<<bucket - 1)
 }
 
 type trialCounters struct {
@@ -78,6 +169,14 @@ type trialCounters struct {
 	updateOffered, updateAccepted, updateDelivered, updateFailed     atomic.Uint64
 	requestOffered, requestAccepted, requestDelivered, requestFailed atomic.Uint64
 	bulkOffered, bulkAccepted, bulkDelivered, bulkFailed             atomic.Uint64
+	inputSendOverhead, requestRoundTrip, updateAge                   durationHistogram
+}
+
+// countWorkloadFailure reports whether an operation failed while the measured
+// workload was still active. An error caused by the measurement cutoff leaves
+// an offered operation unmatched; it is not a transport/application failure.
+func countWorkloadFailure(ctx context.Context, err error) bool {
+	return err != nil && ctx.Err() == nil
 }
 
 // bulkPacer distributes a byte-per-second target across 100 ten-millisecond
@@ -109,6 +208,9 @@ func (c *trialCounters) reset() {
 	} {
 		counter.Store(0)
 	}
+	c.inputSendOverhead.Reset()
+	c.requestRoundTrip.Reset()
+	c.updateAge.Reset()
 }
 
 func (c *trialCounters) snapshot() measurement {
@@ -123,7 +225,38 @@ func (c *trialCounters) snapshot() measurement {
 		Updates:  counts(&c.updateOffered, &c.updateAccepted, &c.updateDelivered, &c.updateFailed),
 		Requests: counts(&c.requestOffered, &c.requestAccepted, &c.requestDelivered, &c.requestFailed),
 		Bulk:     counts(&c.bulkOffered, &c.bulkAccepted, &c.bulkDelivered, &c.bulkFailed),
+		Timing: timingMeasurement{
+			InputSendOverhead: c.inputSendOverhead.Snapshot(),
+			RequestRoundTrip:  c.requestRoundTrip.Snapshot(),
+			UpdateAge:         c.updateAge.Snapshot(),
+		},
 	}
+}
+
+// benchmarkClock provides a monotonic time origin shared by the local server
+// and clients. Its elapsed stamps travel in payloads so update age does not
+// depend on wall-clock synchronization.
+type benchmarkClock struct{ started time.Time }
+
+func newBenchmarkClock() benchmarkClock { return benchmarkClock{started: time.Now()} }
+
+func (c benchmarkClock) Stamp() uint64 {
+	if c.started.IsZero() {
+		return 0
+	}
+	age := time.Since(c.started)
+	if age <= 0 {
+		return 0
+	}
+	return uint64(age)
+}
+
+func (c benchmarkClock) Age(stamp uint64) (time.Duration, bool) {
+	if c.started.IsZero() || stamp == 0 || stamp > uint64(1<<63-1) {
+		return 0, false
+	}
+	age := time.Since(c.started) - time.Duration(stamp)
+	return age, age >= 0
 }
 
 type benchmarkAuthenticator struct{}
@@ -156,6 +289,7 @@ func runSGSPTrial(parent context.Context, cfg config) (result measurement, resul
 		return result, err
 	}
 	counters := &trialCounters{}
+	clock := newBenchmarkClock()
 	limits := sgsp.DefaultLimits()
 	limits.MaxSessions = max(limits.MaxSessions, cfg.Clients)
 	limits.MaxPendingHandshakes = max(limits.MaxPendingHandshakes, cfg.Clients)
@@ -210,7 +344,7 @@ func runSGSPTrial(parent context.Context, cfg config) (result measurement, resul
 			Credentials: func(context.Context) (sgsp.Credential, error) {
 				return sgsp.Credential{Scheme: "benchmark", Data: []byte("benchmark")}, nil
 			},
-			Dispatch: sgsp.DispatchConfig{Mode: sgsp.Handlers, Router: benchmarkClientRouter(counters)},
+			Dispatch: sgsp.DispatchConfig{Mode: sgsp.Handlers, Router: benchmarkClientRouter(counters, clock)},
 		})
 		if err != nil {
 			_ = relay.Close()
@@ -225,7 +359,7 @@ func runSGSPTrial(parent context.Context, cfg config) (result measurement, resul
 		workers.Add(1)
 		go func(session sgsp.Session) {
 			defer workers.Done()
-			runSGSPClient(workCtx, cfg, session, counters)
+			runSGSPClient(workCtx, cfg, session, counters, clock)
 		}(client.client.Session())
 	}
 	if !waitTrial(workCtx, cfg.Warmup) {
@@ -273,6 +407,7 @@ func runQUICTrial(parent context.Context, cfg config) (result measurement, resul
 		return result, err
 	}
 	counters := &trialCounters{}
+	clock := newBenchmarkClock()
 	transportConfig := benchmarkTransportConfig(&tls.Config{Certificates: []tls.Certificate{certificate}})
 	listener, err := quictransport.Listen(serverPacket, transportConfig)
 	if err != nil {
@@ -292,7 +427,7 @@ func runQUICTrial(parent context.Context, cfg config) (result measurement, resul
 			serverWorkers.Add(1)
 			go func() {
 				defer serverWorkers.Done()
-				serveBareQUICConnection(connection, cfg, counters)
+				serveBareQUICConnection(connection, cfg, counters, clock)
 			}()
 		}
 	}()
@@ -345,11 +480,11 @@ func runQUICTrial(parent context.Context, cfg config) (result measurement, resul
 		workers.Add(2)
 		go func(connection transport.Conn) {
 			defer workers.Done()
-			receiveBareUpdates(workCtx, connection, cfg, counters)
+			receiveBareUpdates(workCtx, connection, cfg, counters, clock)
 		}(client.connection)
 		go func(connection transport.Conn) {
 			defer workers.Done()
-			runBareQUICClient(workCtx, cfg, connection, counters)
+			runBareQUICClient(workCtx, cfg, connection, counters, clock)
 		}(client.connection)
 	}
 	if !waitTrial(workCtx, cfg.Warmup) {
@@ -396,12 +531,12 @@ func benchmarkTransportConfig(tlsConfig *tls.Config) quictransport.Config {
 	}
 }
 
-func serveBareQUICConnection(connection transport.Conn, cfg config, counters *trialCounters) {
+func serveBareQUICConnection(connection transport.Conn, cfg config, counters *trialCounters, clock benchmarkClock) {
 	var workers sync.WaitGroup
 	workers.Add(1)
 	go func() {
 		defer workers.Done()
-		serveBareDatagrams(connection, cfg, counters)
+		serveBareDatagrams(connection, cfg, counters, clock)
 	}()
 	for {
 		stream, err := connection.AcceptBidi(connection.Context())
@@ -417,7 +552,7 @@ func serveBareQUICConnection(connection transport.Conn, cfg config, counters *tr
 	}
 }
 
-func serveBareDatagrams(connection transport.Conn, cfg config, counters *trialCounters) {
+func serveBareDatagrams(connection transport.Conn, cfg config, counters *trialCounters, clock benchmarkClock) {
 	var sequence uint64
 	for {
 		datagram, err := connection.ReceiveDatagram(connection.Context())
@@ -433,7 +568,8 @@ func serveBareDatagrams(connection transport.Conn, cfg config, counters *trialCo
 			counters.updateOffered.Add(1)
 		}
 		sequence++
-		update, err := wire.EncodeDatagram(wire.Event{Kind: wire.SequencedKind, Channel: 2, MessageType: uint64(benchmarkUpdateType), Sequence: sequence, Payload: benchmarkPayload(cfg.UpdateBytes, sequence, sequence)}, cfg.UpdateBytes+32)
+		tick, inputSequence, stamp, _ := benchmarkPayloadFields(event.Payload)
+		update, err := wire.EncodeDatagram(wire.Event{Kind: wire.SequencedKind, Channel: 2, MessageType: uint64(benchmarkUpdateType), Sequence: sequence, Payload: benchmarkPayload(cfg.UpdateBytes, tick, inputSequence, stamp)}, cfg.UpdateBytes+32)
 		if err != nil || connection.SendDatagram(connection.Context(), update) != nil {
 			if counters != nil {
 				counters.updateFailed.Add(1)
@@ -491,7 +627,7 @@ func serveBareStream(stream transport.BidiStream, cfg config, counters *trialCou
 	}
 }
 
-func receiveBareUpdates(ctx context.Context, connection transport.Conn, cfg config, counters *trialCounters) {
+func receiveBareUpdates(ctx context.Context, connection transport.Conn, cfg config, counters *trialCounters, clock benchmarkClock) {
 	for {
 		datagram, err := connection.ReceiveDatagram(ctx)
 		if err != nil {
@@ -500,11 +636,16 @@ func receiveBareUpdates(ctx context.Context, connection transport.Conn, cfg conf
 		event, err := wire.DecodeDatagram(datagram.Payload, cfg.UpdateBytes+32)
 		if err == nil && event.Kind == wire.SequencedKind && event.Channel == 2 && event.MessageType == uint64(benchmarkUpdateType) {
 			counters.updateDelivered.Add(1)
+			if _, _, stamp, ok := benchmarkPayloadFields(event.Payload); ok {
+				if age, ok := clock.Age(stamp); ok {
+					counters.updateAge.Record(age)
+				}
+			}
 		}
 	}
 }
 
-func runBareQUICClient(ctx context.Context, cfg config, connection transport.Conn, counters *trialCounters) {
+func runBareQUICClient(ctx context.Context, cfg config, connection transport.Conn, counters *trialCounters, clock benchmarkClock) {
 	inputTicker := time.NewTicker(time.Second / time.Duration(cfg.Hz))
 	defer inputTicker.Stop()
 	var rpcTicker *time.Ticker
@@ -546,19 +687,32 @@ func runBareQUICClient(ctx context.Context, cfg config, connection transport.Con
 			tick++
 			sequence++
 			counters.inputOffered.Add(1)
-			payload, err := wire.EncodeDatagram(wire.Event{Kind: wire.SequencedKind, Channel: 1, MessageType: uint64(benchmarkInputType), Sequence: sequence, Payload: benchmarkPayload(cfg.InputBytes, tick, sequence)}, cfg.InputBytes+32)
-			if err != nil || connection.SendDatagram(ctx, payload) != nil {
+			payload, err := wire.EncodeDatagram(wire.Event{Kind: wire.SequencedKind, Channel: 1, MessageType: uint64(benchmarkInputType), Sequence: sequence, Payload: benchmarkPayload(cfg.InputBytes, tick, sequence, clock.Stamp())}, cfg.InputBytes+32)
+			if err != nil {
 				counters.inputFailed.Add(1)
+				continue
+			}
+			started := time.Now()
+			if err := connection.SendDatagram(ctx, payload); err != nil {
+				if ctx.Err() == nil {
+					counters.inputSendOverhead.Record(time.Since(started))
+				}
+				if countWorkloadFailure(ctx, err) {
+					counters.inputFailed.Add(1)
+				}
 			} else {
+				counters.inputSendOverhead.Record(time.Since(started))
 				counters.inputAccepted.Add(1)
 			}
 		case <-rpc:
 			counters.requestOffered.Add(1)
+			started := time.Now()
 			if err := callBareQUIC(ctx, connection); err != nil {
 				if ctx.Err() == nil {
 					counters.requestFailed.Add(1)
 				}
 			} else {
+				counters.requestRoundTrip.Record(time.Since(started))
 				counters.requestAccepted.Add(1)
 			}
 		case <-bulk:
@@ -663,12 +817,13 @@ func abortBidiOnContext(ctx context.Context, stream transport.BidiStream) func()
 
 func benchmarkServerRouter(cfg config, counters *trialCounters) *sgsp.Router {
 	router := sgsp.NewRouter()
-	update := benchmarkPayload(cfg.UpdateBytes, 0, 0)
 	_ = router.OnEvent(benchmarkInputType, func(ctx context.Context, incoming *sgsp.Incoming) {
 		if counters != nil {
 			counters.inputDelivered.Add(1)
 			counters.updateOffered.Add(1)
 		}
+		tick, sequence, stamp, _ := benchmarkPayloadFields(incoming.Payload)
+		update := benchmarkPayload(cfg.UpdateBytes, tick, sequence, stamp)
 		if err := incoming.Session.Send(ctx, benchmarkUpdateType, update, sgsp.SendOptions{Channel: 2, Delivery: sgsp.UnreliableSequenced}); err != nil {
 			if counters != nil {
 				counters.updateFailed.Add(1)
@@ -712,17 +867,22 @@ func copyBenchmarkBulk(stream io.Reader, counters *trialCounters) {
 	}
 }
 
-func benchmarkClientRouter(counters *trialCounters) *sgsp.Router {
+func benchmarkClientRouter(counters *trialCounters, clock benchmarkClock) *sgsp.Router {
 	router := sgsp.NewRouter()
-	_ = router.OnEvent(benchmarkUpdateType, func(context.Context, *sgsp.Incoming) {
+	_ = router.OnEvent(benchmarkUpdateType, func(_ context.Context, incoming *sgsp.Incoming) {
 		if counters != nil {
 			counters.updateDelivered.Add(1)
+			if _, _, stamp, ok := benchmarkPayloadFields(incoming.Payload); ok {
+				if age, ok := clock.Age(stamp); ok {
+					counters.updateAge.Record(age)
+				}
+			}
 		}
 	})
 	return router
 }
 
-func runSGSPClient(ctx context.Context, cfg config, session sgsp.Session, counters *trialCounters) {
+func runSGSPClient(ctx context.Context, cfg config, session sgsp.Session, counters *trialCounters, clock benchmarkClock) {
 	inputTicker := time.NewTicker(time.Second / time.Duration(cfg.Hz))
 	defer inputTicker.Stop()
 	var rpcTicker *time.Ticker
@@ -774,13 +934,22 @@ func runSGSPClient(ctx context.Context, cfg config, session sgsp.Session, counte
 			tick++
 			sequence++
 			counters.inputOffered.Add(1)
-			if err := session.Send(ctx, benchmarkInputType, benchmarkPayload(cfg.InputBytes, tick, sequence), sgsp.SendOptions{Channel: 1, Delivery: sgsp.UnreliableSequenced}); err != nil {
-				counters.inputFailed.Add(1)
+			payload := benchmarkPayload(cfg.InputBytes, tick, sequence, clock.Stamp())
+			started := time.Now()
+			if err := session.Send(ctx, benchmarkInputType, payload, sgsp.SendOptions{Channel: 1, Delivery: sgsp.UnreliableSequenced}); err != nil {
+				if ctx.Err() == nil {
+					counters.inputSendOverhead.Record(time.Since(started))
+				}
+				if countWorkloadFailure(ctx, err) {
+					counters.inputFailed.Add(1)
+				}
 			} else {
+				counters.inputSendOverhead.Record(time.Since(started))
 				counters.inputAccepted.Add(1)
 			}
 		case <-rpc:
 			counters.requestOffered.Add(1)
+			started := time.Now()
 			response, err := session.Call(ctx, benchmarkRequestType, make([]byte, benchmarkRPCBytes))
 			if err != nil || len(response) != benchmarkRPCBytes {
 				// The measurement cutoff can cancel a request after it has been
@@ -790,6 +959,7 @@ func runSGSPClient(ctx context.Context, cfg config, session sgsp.Session, counte
 					counters.requestFailed.Add(1)
 				}
 			} else {
+				counters.requestRoundTrip.Record(time.Since(started))
 				counters.requestAccepted.Add(1)
 			}
 		case <-bulk:
@@ -826,7 +996,7 @@ func waitTrial(ctx context.Context, duration time.Duration) bool {
 	}
 }
 
-func benchmarkPayload(size int, tick, sequence uint64) []byte {
+func benchmarkPayload(size int, tick, sequence, stamp uint64) []byte {
 	payload := make([]byte, size)
 	if len(payload) >= 8 {
 		binary.BigEndian.PutUint64(payload[:8], tick)
@@ -834,7 +1004,17 @@ func benchmarkPayload(size int, tick, sequence uint64) []byte {
 	if len(payload) >= 16 {
 		binary.BigEndian.PutUint64(payload[8:16], sequence)
 	}
+	if len(payload) >= 24 {
+		binary.BigEndian.PutUint64(payload[16:24], stamp)
+	}
 	return payload
+}
+
+func benchmarkPayloadFields(payload []byte) (tick, sequence, stamp uint64, ok bool) {
+	if len(payload) < 24 {
+		return 0, 0, 0, false
+	}
+	return binary.BigEndian.Uint64(payload[:8]), binary.BigEndian.Uint64(payload[8:16]), binary.BigEndian.Uint64(payload[16:24]), true
 }
 
 func benchmarkCertificate() (tls.Certificate, *x509.CertPool, error) {
@@ -863,7 +1043,7 @@ func benchmarkCertificate() (tls.Certificate, *x509.CertPool, error) {
 func runtimeSnapshot() runtimeMeasurement {
 	var memory runtime.MemStats
 	runtime.ReadMemStats(&memory)
-	return runtimeMeasurement{GoMaxProcs: runtime.GOMAXPROCS(0), Goroutines: runtime.NumGoroutine(), HeapAlloc: memory.HeapAlloc, RSSBytes: processRSSBytes(), TotalAlloc: memory.TotalAlloc, Mallocs: memory.Mallocs, NumCPU: runtime.NumCPU(), OperatingSystem: runtime.GOOS, Architecture: runtime.GOARCH}
+	return runtimeMeasurement{GoMaxProcs: runtime.GOMAXPROCS(0), Goroutines: runtime.NumGoroutine(), HeapAlloc: memory.HeapAlloc, RSSBytes: processRSSBytes(), CPUSeconds: processCPUSeconds(), TotalAlloc: memory.TotalAlloc, Mallocs: memory.Mallocs, NumCPU: runtime.NumCPU(), OperatingSystem: runtime.GOOS, Architecture: runtime.GOARCH}
 }
 
 // runtimeDelta preserves the final live-memory snapshot but turns cumulative
@@ -878,6 +1058,11 @@ func runtimeDelta(start, end runtimeMeasurement) runtimeMeasurement {
 		end.Mallocs -= start.Mallocs
 	} else {
 		end.Mallocs = 0
+	}
+	if end.CPUSeconds >= start.CPUSeconds {
+		end.CPUSeconds -= start.CPUSeconds
+	} else {
+		end.CPUSeconds = 0
 	}
 	return end
 }

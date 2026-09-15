@@ -512,12 +512,20 @@ func (s *serverEndpoint) handleConnection(connection transport.Conn) {
 		}
 	}
 	s.mu.Lock()
-	if s.draining || len(s.sessions) >= s.limits.MaxSessions {
+	if s.draining {
 		s.mu.Unlock()
 		if group != nil {
 			s.groupMu.Unlock()
 		}
-		rejectHandshake(ServerDraining, "server unavailable")
+		rejectHandshake(ServerDraining, "server draining")
+		return
+	}
+	if len(s.sessions) >= s.limits.MaxSessions {
+		s.mu.Unlock()
+		if group != nil {
+			s.groupMu.Unlock()
+		}
+		rejectHandshake(ResourceExhausted, "session capacity reached")
 		return
 	}
 	var id SessionID
@@ -849,6 +857,10 @@ func Dial(ctx context.Context, endpoint Endpoint, config ClientConfig) (Client, 
 	}
 	control, err := channel.read(handshakeCtx, limits.ControlBytes)
 	if err != nil {
+		if terminal := terminalConnectionError(handshakeCtx, connection); terminal != nil {
+			_ = packet.Close()
+			return nil, terminal
+		}
 		_ = connection.Close(uint64(ProtocolViolation), "welcome failed")
 		_ = packet.Close()
 		return nil, err
@@ -1125,15 +1137,8 @@ func (c *clientEndpoint) openResume(ctx context.Context) (resumeAttachment, erro
 	}
 	control, err := channel.read(ctx, c.limits.ControlBytes)
 	if err != nil {
-		// A stream read can wake just before quic-go publishes the connection's
-		// application-close cause. Wait for that terminal state (or this attempt's
-		// deadline) before deciding whether a server rejection is retryable.
-		select {
-		case <-connection.Context().Done():
-		case <-ctx.Done():
-		}
-		if value, ok := connection.CloseCode(); ok && terminalCloseCode(Code(value)) {
-			return fail(codeError(Code(value)))
+		if terminal := terminalConnectionError(ctx, connection); terminal != nil {
+			return fail(terminal)
 		}
 		_ = connection.Close(uint64(ProtocolViolation), "resume welcome failed")
 		return fail(err)
@@ -1164,6 +1169,24 @@ func (c *clientEndpoint) openResume(ctx context.Context) (resumeAttachment, erro
 	}
 	return resumeAttachment{packet: packet, connection: connection, channel: channel, welcome: welcome}, nil
 }
+
+// terminalConnectionError waits only for a transport terminal state already
+// implied by a failed control read. QUIC can deliver a stream-read error just
+// before publishing the peer's application-close code on the connection.
+func terminalConnectionError(ctx context.Context, connection transport.Conn) error {
+	if connection == nil {
+		return nil
+	}
+	select {
+	case <-connection.Context().Done():
+	case <-ctx.Done():
+	}
+	if value, ok := connection.CloseCode(); ok && terminalCloseCode(Code(value)) {
+		return codeError(Code(value))
+	}
+	return nil
+}
+
 func (c *clientEndpoint) attachResume(attachment resumeAttachment) error {
 	id, err := parseSessionID(attachment.welcome.SessionID)
 	if err != nil || id != c.session.ID() || attachment.welcome.Owner.toOwner() != c.session.Owner() || attachment.welcome.Limits != c.session.peerLimitsSnapshot() {
@@ -2692,7 +2715,7 @@ func (o *connectionOperations) openStream(ctx context.Context, typ MessageType) 
 		release()
 		return nil, err
 	}
-	return &applicationStream{stream: stream, reader: reader, release: release}, nil
+	return &applicationStream{stream: stream, reader: reader, release: release, current: o.current}, nil
 }
 func (o *connectionOperations) refresh(ctx context.Context, credential Credential) error {
 	o.refreshMu.Lock()
@@ -3247,6 +3270,10 @@ func (o *connectionOperations) readRequestStream(stream transport.BidiStream, re
 			resultCode = observationErrorCode(err)
 			return err
 		}
+		if !o.current() {
+			resultCode = SessionSuperseded
+			return ErrSessionSuperseded
+		}
 		releaseOutgoing, err := o.reserveOutgoingReply(len(payload) + 32)
 		if err != nil {
 			resultCode = Backpressure
@@ -3314,7 +3341,7 @@ func (o *connectionOperations) readRequestStream(stream transport.BidiStream, re
 	}
 }
 func (o *connectionOperations) readCustomStream(stream transport.BidiStream, reader io.Reader, typ MessageType, release func()) {
-	application := &applicationStream{stream: stream, reader: reader, release: release}
+	application := &applicationStream{stream: stream, reader: reader, release: release, current: o.current}
 	incoming := &Incoming{Kind: StreamMessage, Session: o.session, Epoch: o.epoch, Type: typ, Stream: application, ctx: o.context()}
 	if o.mode == Polling {
 		if !o.dispatch(incoming) {
@@ -3353,13 +3380,24 @@ type applicationStream struct {
 	stream      transport.BidiStream
 	reader      io.Reader
 	release     func()
+	current     func() bool
 	releaseOnce sync.Once
 }
 
-func (s *applicationStream) Read(payload []byte) (int, error)  { return s.reader.Read(payload) }
-func (s *applicationStream) Write(payload []byte) (int, error) { return s.stream.Write(payload) }
-func (s *applicationStream) CloseWrite() error                 { return s.stream.CloseWrite() }
-func (s *applicationStream) CloseRead() error                  { s.stream.CloseRead(); return nil }
+func (s *applicationStream) Read(payload []byte) (int, error) { return s.reader.Read(payload) }
+func (s *applicationStream) Write(payload []byte) (int, error) {
+	if !s.isCurrent() {
+		return 0, ErrSessionSuperseded
+	}
+	return s.stream.Write(payload)
+}
+func (s *applicationStream) CloseWrite() error {
+	if !s.isCurrent() {
+		return ErrSessionSuperseded
+	}
+	return s.stream.CloseWrite()
+}
+func (s *applicationStream) CloseRead() error { s.stream.CloseRead(); return nil }
 func (s *applicationStream) Close() error {
 	err := s.stream.CloseWrite()
 	s.stream.CloseRead()
@@ -3376,6 +3414,9 @@ func (s *applicationStream) releaseSlot() {
 			s.release()
 		}
 	})
+}
+func (s *applicationStream) isCurrent() bool {
+	return s != nil && (s.current == nil || s.current())
 }
 
 func writeCustomAcceptance(stream transport.BidiStream, status Code, diagnostic string) error {

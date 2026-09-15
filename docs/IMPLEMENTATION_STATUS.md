@@ -25,12 +25,23 @@ GOCACHE=/tmp/sgsp-go-build go test -race -count=20 ./placement ./placement/memor
 GOCACHE=/tmp/sgsp-go-build go test -race -count=10 ./cmd/sgspbench            PASS
 GOCACHE=/tmp/sgsp-go-build go test -race -count=5 -run '^TestNATRebinding$' . PASS
 GOCACHE=/tmp/sgsp-go-build go test -race -count=5 -run '^TestUnknownRequestOutcome' . PASS
-GOCACHE=/tmp/sgsp-go-build go test -race -count=5 -run '^TestEpochFence$' .  PASS
+GOCACHE=/tmp/sgsp-go-build go test -race -count=5 -run '^TestEpochFence' .   PASS
 GOCACHE=/tmp/sgsp-go-build go test -race -count=5 -run '^TestDraining$' .    PASS
 GOCACHE=/tmp/sgsp-go-build go test -race -count=10 -run '^TestSlowConsumer$' . PASS
 GOCACHE=/tmp/sgsp-go-build go test -race -count=5 -run '^TestOwnerRestart$' . PASS
 GOCACHE=/tmp/sgsp-go-build go test -race -count=5 -run '^TestGroupCloseRace$' . PASS
 GOCACHE=/tmp/sgsp-go-build go test -race -count=10 -run '^TestClientReconnectLoop$' . PASS
+GOCACHE=/tmp/sgsp-go-build go test -race -count=5 -run '^TestSessionAdmissionLimit$' . PASS
+GOCACHE=/tmp/sgsp-go-build go test -race -count=20 -run '^TestTerminalIDCache' . PASS
+GOCACHE=/tmp/sgsp-go-build go test -race -count=1 -run '^TestShutdownCleanup$' . PASS
+GOCACHE=/tmp/sgsp-go-build go test -count=10 \
+  -run 'Test(ShutdownCleanup|SlowConsumer|GlobalBudget)$' ./...              PASS
+GOMAXPROCS=1 GOCACHE=/tmp/sgsp-go-build go test ./internal/wire -run '^$' \
+  -fuzz '^FuzzControl$' -fuzztime=60s -parallel=1                         PASS
+GOMAXPROCS=1 GOCACHE=/tmp/sgsp-go-build go test ./internal/wire -run '^$' \
+  -fuzz '^FuzzEvent$' -fuzztime=60s -parallel=1                           PASS
+GOMAXPROCS=1 GOCACHE=/tmp/sgsp-go-build go test ./internal/wire -run '^$' \
+  -fuzz '^FuzzRequest$' -fuzztime=60s -parallel=1                         PASS
 go vet ./...                                                                   PASS
 test -z "$(gofmt -l -- *.go internal/**/*.go examples/**/*.go cmd/**/*.go \
   placement/**/*.go 2>/dev/null)"                                             PASS
@@ -65,30 +76,44 @@ reported as passed:
 - broader terminal cleanup coverage from section 8. Barrier-driven
   100-candidate concurrent commit, real lost-WELCOME retry with an unseen
   epoch, positive and credential-bound resume cases, direct revocation,
-  pre-grace resume/post-grace expiry, a real-QUIC polling epoch-fencing test
-  that discards epoch-1 work and delivers only resumed epoch-2 work, a
+  pre-grace resume/post-grace expiry, a real-QUIC epoch-fencing test that
+  discards epoch-1 work, rejects stale reply/custom-stream writes, and
+  delivers only resumed epoch-2 work, a
   real-QUIC pending request/custom-stream loss cleanup test, a
   real-QUIC committed-request loss/resume test that records `OutcomeUnknown`
   without replaying the committed operation,
   interrupted reliable-stream loss handoff (which must not be relabeled as a
-  protocol violation), and bounded expired-ID cache tests are present;
-- full 60-second decoder fuzz campaigns. One-worker five-second diagnostics
-  completed successfully for `FuzzControl`, `FuzzEvent`, and `FuzzRequest`.
-  An attempted 60-second `FuzzControl` campaign made 142,731 executions and
-  then stopped making progress before the execution environment ended without
-  a `PASS` result, so it is not recorded as the required M1 fuzz evidence;
+  protocol violation), bounded expired-ID cache tests, and a real-QUIC
+  1,000-cycle shutdown-cleanup test (request, loss, explicit resume, close,
+  no retained session/application budget, and post-GC heap tolerance) are
+  present;
 - PostgreSQL integration execution against a disposable service; the explicit
   migration runner and its local integrity checks compile, but no service was
-  available here;
+  available here. On 2026-09-15, `go -C integration/postgres test -race -v
+  ./...` reported the required explicit incomplete-check error for both SQL
+  cases because `SGSP_TEST_DATABASE_URL` is unset;
 - the M8 impairment matrix and published performance trial results.
   `cmd/sgspbench` now runs a bounded single SGSP or bare-QUIC trial through
   per-client deterministic two-socket UDP relays, exercising sequenced
-  input/update datagrams, request/reply, and paced raw-stream bulk data.
+  input/update datagrams, request/reply, and paced raw-stream bulk data. Its
+  JSON uses bounded fixed-memory histograms for local input-send API-call
+  duration, successful request round trip, and same-process update age;
+  percentile fields are upper bounds rather than retained per-operation
+  samples.
   `scripts/run-benchmark-matrix.sh` builds both binaries, captures environment
   metadata, runs the configured five-seed matrix, and invokes
   `cmd/sgspbenchreport` to index the JSON results. A 100 ms, one-client,
-  five-seed tooling smoke passed locally, but the required 60-second matrix,
-  plateau campaign, and published report remain incomplete.
+  five-seed tooling smoke passed locally. A paired full 60-second pilot
+  (one client, 60 Hz, 20 ms RTT, seed 1, `GOMAXPROCS=1`) completed for both
+  implementations with no failed operations, relay drops, or relay overload:
+  SGSP accepted 3,601 inputs and delivered 3,600, accepted/delivered 3,600
+  updates, delivered 120 requests, and delivered 3,774,874 bulk bytes; bare
+  QUIC accepted/delivered 3,600 inputs and updates, delivered 120 requests,
+  and delivered 3,774,874 bulk bytes. Offered-but-unmatched work at the
+  measurement cutoff is deliberately not counted as a failure. These are
+  local pilot artifacts only, not a published result. They cannot establish
+  capacity or variance, so the required five-seed 60-second matrix, plateau
+  campaign, and published report remain incomplete.
 
 The UDP receive-buffer warning emitted by quic-go on this host (416 KiB versus
 its 7 MiB desired buffer) is environmental and remains recorded as a
