@@ -447,7 +447,7 @@ func TestUnknownRoutes(t *testing.T) {
 	}
 }
 
-func TestUnknownRequestOutcome(t *testing.T) {
+func TestUnknownRequestOutcomeAcceptedSession(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	router := NewRouter()

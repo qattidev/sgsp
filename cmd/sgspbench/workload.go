@@ -13,7 +13,10 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"os"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -62,8 +65,9 @@ type runtimeMeasurement struct {
 	GoMaxProcs      int    `json:"gomaxprocs"`
 	Goroutines      int    `json:"goroutines"`
 	HeapAlloc       uint64 `json:"heap_alloc"`
-	TotalAlloc      uint64 `json:"total_alloc"`
-	Mallocs         uint64 `json:"mallocs"`
+	RSSBytes        uint64 `json:"rss_bytes"`
+	TotalAlloc      uint64 `json:"allocated_bytes"`
+	Mallocs         uint64 `json:"allocations"`
 	NumCPU          int    `json:"num_cpu"`
 	OperatingSystem string `json:"operating_system"`
 	Architecture    string `json:"architecture"`
@@ -231,6 +235,7 @@ func runSGSPTrial(parent context.Context, cfg config) (result measurement, resul
 	}
 	counters.reset()
 	started := time.Now()
+	runtimeStarted := runtimeSnapshot()
 	if !waitTrial(workCtx, cfg.Duration) {
 		stopWork()
 		workers.Wait()
@@ -240,7 +245,7 @@ func runSGSPTrial(parent context.Context, cfg config) (result measurement, resul
 	workers.Wait()
 	result = counters.snapshot()
 	result.Duration = time.Since(started)
-	result.Runtime = runtimeSnapshot()
+	result.Runtime = runtimeDelta(runtimeStarted, runtimeSnapshot())
 	for _, client := range clients {
 		stats := client.relay.Stats()
 		result.Relay.Forwarded += stats.Forwarded
@@ -354,6 +359,7 @@ func runQUICTrial(parent context.Context, cfg config) (result measurement, resul
 	}
 	counters.reset()
 	started := time.Now()
+	runtimeStarted := runtimeSnapshot()
 	if !waitTrial(workCtx, cfg.Duration) {
 		stopWork()
 		workers.Wait()
@@ -366,7 +372,7 @@ func runQUICTrial(parent context.Context, cfg config) (result measurement, resul
 	workers.Wait()
 	result = counters.snapshot()
 	result.Duration = time.Since(started)
-	result.Runtime = runtimeSnapshot()
+	result.Runtime = runtimeDelta(runtimeStarted, runtimeSnapshot())
 	for _, client := range clients {
 		stats := client.relay.Stats()
 		result.Relay.Forwarded += stats.Forwarded
@@ -857,5 +863,40 @@ func benchmarkCertificate() (tls.Certificate, *x509.CertPool, error) {
 func runtimeSnapshot() runtimeMeasurement {
 	var memory runtime.MemStats
 	runtime.ReadMemStats(&memory)
-	return runtimeMeasurement{GoMaxProcs: runtime.GOMAXPROCS(0), Goroutines: runtime.NumGoroutine(), HeapAlloc: memory.HeapAlloc, TotalAlloc: memory.TotalAlloc, Mallocs: memory.Mallocs, NumCPU: runtime.NumCPU(), OperatingSystem: runtime.GOOS, Architecture: runtime.GOARCH}
+	return runtimeMeasurement{GoMaxProcs: runtime.GOMAXPROCS(0), Goroutines: runtime.NumGoroutine(), HeapAlloc: memory.HeapAlloc, RSSBytes: processRSSBytes(), TotalAlloc: memory.TotalAlloc, Mallocs: memory.Mallocs, NumCPU: runtime.NumCPU(), OperatingSystem: runtime.GOOS, Architecture: runtime.GOARCH}
+}
+
+// runtimeDelta preserves the final live-memory snapshot but turns cumulative
+// allocator counters into the work performed during the measured interval.
+func runtimeDelta(start, end runtimeMeasurement) runtimeMeasurement {
+	if end.TotalAlloc >= start.TotalAlloc {
+		end.TotalAlloc -= start.TotalAlloc
+	} else {
+		end.TotalAlloc = 0
+	}
+	if end.Mallocs >= start.Mallocs {
+		end.Mallocs -= start.Mallocs
+	} else {
+		end.Mallocs = 0
+	}
+	return end
+}
+
+// processRSSBytes records Linux resident memory when it is available. A zero
+// value is explicitly "unavailable" on platforms without procfs rather than
+// a claim of zero resident memory.
+func processRSSBytes() uint64 {
+	data, err := os.ReadFile("/proc/self/statm")
+	if err != nil {
+		return 0
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) < 2 {
+		return 0
+	}
+	pages, err := strconv.ParseUint(fields[1], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return pages * uint64(os.Getpagesize())
 }

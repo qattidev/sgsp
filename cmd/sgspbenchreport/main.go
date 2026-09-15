@@ -34,11 +34,11 @@ type operationCounts struct {
 }
 
 type measurement struct {
-	Duration time.Duration      `json:"duration"`
-	Inputs   operationCounts    `json:"inputs"`
-	Updates  operationCounts    `json:"updates"`
-	Requests operationCounts    `json:"requests"`
-	Bulk     operationCounts    `json:"bulk"`
+	Duration time.Duration   `json:"duration"`
+	Inputs   operationCounts `json:"inputs"`
+	Updates  operationCounts `json:"updates"`
+	Requests operationCounts `json:"requests"`
+	Bulk     operationCounts `json:"bulk"`
 }
 
 type trialResult struct {

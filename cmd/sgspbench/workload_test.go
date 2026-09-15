@@ -82,3 +82,12 @@ func TestBulkPacerPreservesConfiguredRate(t *testing.T) {
 		}
 	}
 }
+
+func TestRuntimeDeltaUsesIntervalAllocationCounters(t *testing.T) {
+	start := runtimeMeasurement{TotalAlloc: 100, Mallocs: 40}
+	end := runtimeMeasurement{HeapAlloc: 50, RSSBytes: 70, TotalAlloc: 125, Mallocs: 49}
+	got := runtimeDelta(start, end)
+	if got.HeapAlloc != 50 || got.RSSBytes != 70 || got.TotalAlloc != 25 || got.Mallocs != 9 {
+		t.Fatalf("runtime delta = %#v", got)
+	}
+}

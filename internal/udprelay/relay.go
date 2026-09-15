@@ -27,6 +27,9 @@ type Config struct {
 	Seed          uint64
 	MaxPackets    int
 	MaxBytes      int64
+	// OnForward observes a successfully forwarded packet direction. It is a
+	// relay-harness hook and must return promptly; it receives no packet data.
+	OnForward func(Direction)
 }
 
 type Stats struct {
@@ -97,14 +100,46 @@ func New(clientListen, upstreamListen string, upstream net.Addr, config Config) 
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	relay := &Relay{client: client, upstream: upstreamSocket, upstreamAddr: upstream, ctx: ctx, cancel: cancel, done: make(chan struct{}), in: make(chan relayPacket, config.MaxPackets), maxPackets: config.MaxPackets, maxBytes: config.MaxBytes}
-	go relay.read(ClientToServer)
-	go relay.read(ServerToClient)
+	go relay.readClient()
+	go relay.readUpstream(upstreamSocket)
 	go relay.schedule(config)
 	return relay, nil
 }
 
-func (r *Relay) ClientAddr() net.Addr   { return r.client.LocalAddr() }
-func (r *Relay) UpstreamAddr() net.Addr { return r.upstream.LocalAddr() }
+func (r *Relay) ClientAddr() net.Addr { return r.client.LocalAddr() }
+func (r *Relay) UpstreamAddr() net.Addr {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.upstream.LocalAddr()
+}
+
+// RebindUpstream replaces the relay's server-facing UDP socket. Packets sent
+// after it returns use a new source port while the client-facing address stays
+// stable, allowing a real transport NAT-rebinding test without packet parsing.
+func (r *Relay) RebindUpstream(listen string) error {
+	if r == nil || listen == "" {
+		return errors.New("sgsp UDP relay: invalid upstream rebind")
+	}
+	replacement, err := net.ListenPacket("udp", listen)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	if r.ctx.Err() != nil {
+		r.mu.Unlock()
+		_ = replacement.Close()
+		return context.Canceled
+	}
+	previous := r.upstream
+	r.upstream = replacement
+	r.mu.Unlock()
+	go r.readUpstream(replacement)
+	_ = previous.Close()
+	return nil
+}
 
 // SetBlackhole drops a complete direction while retaining the sockets. It is
 // useful for deterministic loss/reconnect experiments.
@@ -145,36 +180,43 @@ func (r *Relay) Close() error {
 	r.once.Do(func() {
 		r.cancel()
 		_ = r.client.Close()
-		_ = r.upstream.Close()
+		r.mu.Lock()
+		upstream := r.upstream
+		r.mu.Unlock()
+		_ = upstream.Close()
 	})
 	<-r.done
 	return nil
 }
 
-func (r *Relay) read(direction Direction) {
-	socket := r.client
-	if direction == ServerToClient {
-		socket = r.upstream
-	}
+func (r *Relay) readClient() {
 	buffer := make([]byte, 65_535)
 	for {
-		count, source, err := socket.ReadFrom(buffer)
+		count, source, err := r.client.ReadFrom(buffer)
 		if err != nil {
 			return
 		}
 		payload := append([]byte(nil), buffer[:count]...)
-		if direction == ClientToServer {
-			r.mu.Lock()
-			r.clientAddr = source
-			r.mu.Unlock()
-			r.enqueue(direction, payload, r.upstreamAddr)
-			continue
+		r.mu.Lock()
+		r.clientAddr = source
+		r.mu.Unlock()
+		r.enqueue(ClientToServer, payload, r.upstreamAddr)
+	}
+}
+
+func (r *Relay) readUpstream(socket net.PacketConn) {
+	buffer := make([]byte, 65_535)
+	for {
+		count, _, err := socket.ReadFrom(buffer)
+		if err != nil {
+			return
 		}
+		payload := append([]byte(nil), buffer[:count]...)
 		r.mu.Lock()
 		target := r.clientAddr
 		r.mu.Unlock()
 		if target != nil {
-			r.enqueue(direction, payload, target)
+			r.enqueue(ServerToClient, payload, target)
 		}
 	}
 }
@@ -253,13 +295,18 @@ func (r *Relay) schedule(config Config) {
 				packet := heap.Pop(&queues).(relayPacket)
 				socket := r.client
 				if packet.direction == ClientToServer {
+					r.mu.Lock()
 					socket = r.upstream
+					r.mu.Unlock()
 				}
 				if _, err := socket.WriteTo(packet.payload, packet.target); err != nil {
 					r.recordDrop(len(packet.payload))
 					continue
 				}
 				r.recordForward(len(packet.payload))
+				if config.OnForward != nil {
+					config.OnForward(packet.direction)
+				}
 			}
 		case <-r.ctx.Done():
 			if timer != nil {

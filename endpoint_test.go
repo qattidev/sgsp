@@ -21,6 +21,7 @@ import (
 	"qattidev/sgsp/internal/quictransport"
 	"qattidev/sgsp/internal/runtime"
 	"qattidev/sgsp/internal/transport"
+	"qattidev/sgsp/internal/udprelay"
 	"qattidev/sgsp/internal/wire"
 )
 
@@ -301,6 +302,116 @@ func TestAdmissionBinding(t *testing.T) {
 	case <-client.Session().Context().Done():
 	case <-time.After(time.Second):
 		t.Fatal("group close did not close session")
+	}
+	_ = client.Close(context.Background())
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGroupCloseRace(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifier := &testAdmissionVerifier{}
+	commitStarted := make(chan struct{})
+	releaseCommit := make(chan struct{})
+	persistFailure := errors.New("durable group close unavailable")
+	var commits atomic.Int32
+	server, err := NewServer(ServerConfig{
+		TLS:       &tls.Config{Certificates: []tls.Certificate{certificate}},
+		App:       AppIdentity{ID: "app", Version: "1"},
+		Owner:     Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}},
+		Auth:      &testAuthenticator{},
+		Admission: verifier,
+		AuthorizeGroup: func(_ context.Context, principal Principal, group string) error {
+			if principal.Subject != "player" || group != "match" {
+				return ErrForbidden
+			}
+			return nil
+		},
+		CommitGroupClose: func(_ context.Context, _ AppIdentity, group string, _ Owner) error {
+			if group != "match" {
+				return ErrInvalidArgument
+			}
+			if commits.Add(1) == 1 {
+				close(commitStarted)
+				<-releaseCommit
+				return persistFailure
+			}
+			return nil
+		},
+		Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := server.Owner()
+	verifier.admission = Admission{App: AppIdentity{ID: "app", Version: "1"}, PrincipalIssuer: "test", Subject: "player", GroupKey: "match", Owner: owner, ExpiresAt: time.Now().Add(time.Minute)}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	clientConfig := ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, GroupKey: "match", AdmissionTicket: "ticket", Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}}
+	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, clientConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeResult := make(chan error, 1)
+	go func() { closeResult <- server.CloseGroup(ctx, "match") }()
+	select {
+	case <-commitStarted:
+	case <-ctx.Done():
+		t.Fatal("group close did not reach durable commit")
+	}
+	// The closure flag is set before persistence. An admission racing the
+	// unavailable durable store must be rejected locally, not admitted and then
+	// later moved to another owner.
+	if raced, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, clientConfig); err == nil {
+		_ = raced.Close(context.Background())
+		t.Fatal("group admission succeeded while group closure was pending")
+	}
+	close(releaseCommit)
+	select {
+	case err := <-closeResult:
+		if !errors.Is(err, persistFailure) {
+			t.Fatalf("first group close = %v, want persistence error", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("first group close did not return")
+	}
+	endpoint.groupMu.Lock()
+	group := endpoint.groups["match"]
+	closed, persisted := group != nil && group.closed, group != nil && group.persisted
+	endpoint.groupMu.Unlock()
+	if !closed || persisted {
+		t.Fatalf("failed durable close group state = closed:%t persisted:%t", closed, persisted)
+	}
+	if err := server.CloseGroup(ctx, "match"); err != nil {
+		t.Fatalf("group close retry = %v", err)
+	}
+	if commits.Load() != 2 {
+		t.Fatalf("durable close attempts = %d, want 2", commits.Load())
+	}
+	endpoint.groupMu.Lock()
+	persisted = endpoint.groups["match"].persisted
+	endpoint.groupMu.Unlock()
+	if !persisted {
+		t.Fatal("successful durable close was not retained")
+	}
+	select {
+	case <-client.Session().Context().Done():
+	case <-ctx.Done():
+		t.Fatal("group close did not terminate the existing session")
 	}
 	_ = client.Close(context.Background())
 	stop()
@@ -1121,6 +1232,189 @@ func TestResumeCredentialBinding(t *testing.T) {
 	}
 }
 
+func TestNATRebinding(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverRouter := NewRouter()
+	if err := serverRouter.OnEvent(51, func(ctx context.Context, incoming *Incoming) {
+		_ = incoming.Session.Send(ctx, 52, append([]byte(nil), incoming.Payload...), SendOptions{Channel: 2, Delivery: UnreliableSequenced})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Dispatch: DispatchConfig{Mode: Handlers, Router: serverRouter}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	upstream, err := net.ResolveUDPAddr("udp", packet.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	forwarded := make(chan udprelay.Direction, 256)
+	relay, err := udprelay.New("127.0.0.1:0", "127.0.0.1:0", upstream, udprelay.Config{Seed: 51, OnForward: func(direction udprelay.Direction) {
+		select {
+		case forwarded <- direction:
+		default:
+		}
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relay.Close()
+	updates := make(chan string, 2)
+	clientRouter := NewRouter()
+	if err := clientRouter.OnEvent(52, func(_ context.Context, incoming *Incoming) { updates <- string(incoming.Payload) }); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, Endpoint{Address: relay.ClientAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, DisableReconnect: true, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: clientRouter}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeEpoch := client.Session().Epoch()
+	exchange := func(payload string) {
+		t.Helper()
+		if err := client.Session().Send(ctx, 51, []byte(payload), SendOptions{Channel: 1, Delivery: UnreliableSequenced}); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case update := <-updates:
+			if update != payload {
+				t.Fatalf("echo update = %q, want %q", update, payload)
+			}
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
+	exchange("before")
+	for {
+		select {
+		case <-forwarded:
+		default:
+			goto drainedForwarding
+		}
+	}
+
+drainedForwarding:
+	if err := relay.RebindUpstream("127.0.0.1:0"); err != nil {
+		t.Fatal(err)
+	}
+	// The first non-probing packet on the new source path causes the server to
+	// send PATH_CHALLENGE. QUIC switches only after receiving PATH_RESPONSE and
+	// a subsequent non-probing packet on that validated path. The probe's
+	// unreliable echo is intentionally not awaited because it can be addressed
+	// to the old path while validation is in progress. The relay's direction-only
+	// forwarding hook makes the validation sequence a barrier instead of a
+	// timing-dependent sleep.
+	if err := client.Session().Send(ctx, 51, []byte("rebinding-probe"), SendOptions{Channel: 1, Delivery: UnreliableSequenced}); err != nil {
+		t.Fatal(err)
+	}
+	waitForward := func(want udprelay.Direction) {
+		t.Helper()
+		for {
+			select {
+			case direction := <-forwarded:
+				if direction == want {
+					return
+				}
+			case <-ctx.Done():
+				t.Fatalf("waiting for %v relay forwarding: %v", want, ctx.Err())
+			}
+		}
+	}
+	waitForward(udprelay.ClientToServer) // non-probing packet on the new path
+	waitForward(udprelay.ServerToClient) // server PATH_CHALLENGE
+	waitForward(udprelay.ClientToServer) // client PATH_RESPONSE
+	exchange("after")
+	if client.Session().State() != Active || client.Session().Epoch() != beforeEpoch {
+		t.Fatalf("client rebinding state/epoch = %v/%d, want active/%d", client.Session().State(), client.Session().Epoch(), beforeEpoch)
+	}
+	serverSession := endpoint.Sessions()[0]
+	if serverSession.State() != Active || serverSession.Epoch() != beforeEpoch {
+		t.Fatalf("server rebinding state/epoch = %v/%d, want active/%d", serverSession.State(), serverSession.Epoch(), beforeEpoch)
+	}
+	_ = client.Close(context.Background())
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOwnerRestart(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := packet.LocalAddr().String()
+	config := ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: address, ServerName: "localhost"}}, Auth: &testAuthenticator{}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}}
+	first, err := NewServer(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstEndpoint := first.(*serverEndpoint)
+	firstCtx, stopFirst := context.WithCancel(context.Background())
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- first.Serve(firstCtx, packet) }()
+	<-firstEndpoint.started
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, Endpoint{Address: address, ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, DisableReconnect: true, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	concrete := client.(*clientEndpoint)
+	firstOwner := first.Owner()
+	if firstOwner.Incarnation == (Incarnation{}) {
+		t.Fatal("first owner has no process incarnation")
+	}
+	stopFirst()
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	restartedPacket, err := net.ListenPacket("udp", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewServer(config)
+	if err != nil {
+		_ = restartedPacket.Close()
+		t.Fatal(err)
+	}
+	secondOwner := second.Owner()
+	if secondOwner.ID != firstOwner.ID || secondOwner.Incarnation == firstOwner.Incarnation {
+		_ = restartedPacket.Close()
+		t.Fatalf("restart owner = %#v, want same ID and a fresh incarnation from %#v", secondOwner, firstOwner)
+	}
+	secondEndpoint := second.(*serverEndpoint)
+	secondCtx, stopSecond := context.WithCancel(context.Background())
+	defer stopSecond()
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- second.Serve(secondCtx, restartedPacket) }()
+	<-secondEndpoint.started
+	if _, err := concrete.openResume(ctx); err == nil {
+		t.Fatal("old process resume unexpectedly attached to restarted owner")
+	}
+	_ = client.Close(context.Background())
+	stopSecond()
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLostResumeWelcome(t *testing.T) {
 	certificate, roots := endpointCertificate(t)
 	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -1252,7 +1546,7 @@ func TestResumeGrace(t *testing.T) {
 	}
 }
 
-func TestTransportLossDiscardsPollingEpochQueue(t *testing.T) {
+func TestEpochFence(t *testing.T) {
 	certificate, roots := endpointCertificate(t)
 	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -1322,6 +1616,37 @@ func TestTransportLossDiscardsPollingEpochQueue(t *testing.T) {
 	if _, err := server.Next(empty); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("discarded epoch was still deliverable: %v", err)
 	}
+	attachment, err := clientEndpoint.openResume(ctx)
+	if err != nil {
+		t.Fatalf("resume after epoch fence = %v", err)
+	}
+	if err := clientEndpoint.attachResume(attachment); err != nil {
+		t.Fatalf("attach after epoch fence = %v", err)
+	}
+	clientEndpoint.mu.Lock()
+	clientEndpoint.reconnecting = false
+	clientEndpoint.mu.Unlock()
+	waitForSessionState(t, ctx, clientEndpoint.session, Active, 2)
+	waitForSessionState(t, ctx, serverSession, Active, 2)
+	resumed, err := server.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed.Kind != LifecycleMessage || resumed.Lifecycle == nil || resumed.Lifecycle.Kind != Resumed || resumed.Epoch != 2 {
+		t.Fatalf("resumed polling item = %#v", resumed)
+	}
+	resumed.Release()
+	if err := client.Session().Send(ctx, 91, []byte("current-epoch"), SendOptions{Delivery: ReliableOrdered}); err != nil {
+		t.Fatal(err)
+	}
+	current, err := server.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Kind != Event || current.Epoch != 2 || string(current.Payload) != "current-epoch" {
+		t.Fatalf("current epoch polling item = %#v", current)
+	}
+	current.Release()
 	_ = client.Close(context.Background())
 	stop()
 	if err := <-serveDone; err != nil {
@@ -1329,7 +1654,92 @@ func TestTransportLossDiscardsPollingEpochQueue(t *testing.T) {
 	}
 }
 
-func TestTransportLossUnblocksPendingRequestAndStream(t *testing.T) {
+func TestUnknownRequestOutcome(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var committed atomic.Int32
+	started := make(chan struct{}, 1)
+	router := NewRouter()
+	if err := router.OnRequest(94, func(ctx context.Context, _ *Incoming) {
+		committed.Add(1) // The application commit happens before response delivery.
+		started <- struct{}{}
+		<-ctx.Done()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Dispatch: DispatchConfig{Mode: Handlers, Router: router}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	concrete := client.(*clientEndpoint)
+	concrete.mu.Lock()
+	concrete.reconnecting = true // The test, rather than jitter, drives the resume.
+	concrete.mu.Unlock()
+	callDone := make(chan error, 1)
+	go func() {
+		_, err := client.Session().Call(ctx, 94, []byte("counted-operation"))
+		callDone <- err
+	}()
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	serverSession := endpoint.Sessions()[0].(*sessionRecord)
+	if err := closeCurrentTransport(serverSession, "lose response after commit"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-callDone:
+		var outcome *Error
+		if !errors.As(err, &outcome) || !outcome.OutcomeUnknown || outcome.Cause == nil {
+			t.Fatalf("Call after committed transport loss = %#v, want OutcomeUnknown with a cause", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("Call remained blocked after transport loss")
+	}
+	waitForSessionState(t, ctx, concrete.session, Suspended, 1)
+	waitForSessionState(t, ctx, serverSession, Suspended, 1)
+	attachment, err := concrete.openResume(ctx)
+	if err != nil {
+		t.Fatalf("resume after unknown outcome = %v", err)
+	}
+	if err := concrete.attachResume(attachment); err != nil {
+		t.Fatalf("attach after unknown outcome = %v", err)
+	}
+	concrete.mu.Lock()
+	concrete.reconnecting = false
+	concrete.mu.Unlock()
+	waitForSessionState(t, ctx, concrete.session, Active, 2)
+	waitForSessionState(t, ctx, serverSession, Active, 2)
+	if got := committed.Load(); got != 1 {
+		t.Fatalf("committed operation executions = %d, want 1; Call must not replay after resume", got)
+	}
+	_ = client.Close(context.Background())
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTransportLossCleanup(t *testing.T) {
 	certificate, roots := endpointCertificate(t)
 	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -1415,6 +1825,105 @@ func TestTransportLossUnblocksPendingRequestAndStream(t *testing.T) {
 		t.Fatal("custom stream read remained blocked after transport loss")
 	}
 	waitForSessionState(t, ctx, serverSession, Suspended, 1)
+	_ = client.Close(context.Background())
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSlowConsumer(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits := DefaultLimits()
+	limits.QueueMessages = 2
+	limits.SlowConsumerTimeout = 50 * time.Millisecond
+	started := make(chan struct{}, 1)
+	router := NewRouter()
+	if err := router.OnEvent(95, func(ctx context.Context, _ *Incoming) {
+		started <- struct{}{}
+		<-ctx.Done()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Limits: limits, Dispatch: DispatchConfig{Mode: Handlers, Router: router}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Limits: limits, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverSession := endpoint.Sessions()[0].(*sessionRecord)
+	payload := []byte("queued")
+	if err := client.Session().Send(ctx, 95, payload, SendOptions{Delivery: ReliableOrdered}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("first reliable handler did not start")
+	}
+	if err := client.Session().Send(ctx, 95, payload, SendOptions{Delivery: ReliableOrdered}); err != nil {
+		t.Fatal(err)
+	}
+	charge := int64(len(payload) + 32)
+	wantQueuedBytes := 2 * charge
+	for endpoint.applicationBudget.Used() < wantQueuedBytes {
+		select {
+		case <-ctx.Done():
+			t.Fatalf("reliable queue charge = %d, want at least %d", endpoint.applicationBudget.Used(), wantQueuedBytes)
+		case <-time.After(time.Millisecond):
+		}
+	}
+	if err := client.Session().Send(ctx, 95, payload, SendOptions{Delivery: ReliableOrdered}); err != nil {
+		t.Fatal(err)
+	}
+	// The running callback retains its payload charge, while two more messages
+	// fill the bounded handler queue. A fourth reliable frame must wait only
+	// through SlowConsumerTimeout and then close the session.
+	wantQueuedBytes = 3 * charge
+	for endpoint.applicationBudget.Used() < wantQueuedBytes {
+		select {
+		case <-ctx.Done():
+			t.Fatalf("reliable queue charge = %d, want at least %d", endpoint.applicationBudget.Used(), wantQueuedBytes)
+		case <-time.After(time.Millisecond):
+		}
+	}
+	if err := client.Session().Send(ctx, 95, payload, SendOptions{Delivery: ReliableOrdered}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-client.Session().Context().Done():
+	case <-ctx.Done():
+		t.Fatal("slow consumer did not close the peer session")
+	}
+	if code := client.(*clientEndpoint).session.terminalCode(); code != SlowConsumer {
+		t.Fatalf("client slow-consumer terminal code = %v, want %v", code, SlowConsumer)
+	}
+	if code := serverSession.terminalCode(); code != SlowConsumer {
+		t.Fatalf("server slow-consumer terminal code = %v, want %v", code, SlowConsumer)
+	}
+	for len(endpoint.Sessions()) != 0 {
+		select {
+		case <-endpoint.changed:
+		case <-ctx.Done():
+			t.Fatalf("slow consumer retained %d active sessions", len(endpoint.Sessions()))
+		}
+	}
 	_ = client.Close(context.Background())
 	stop()
 	if err := <-serveDone; err != nil {
@@ -1854,7 +2363,7 @@ func sendResumeAndDiscardWelcome(ctx context.Context, client *clientEndpoint) (n
 	return packet, connection, nil
 }
 
-func TestDrain(t *testing.T) {
+func TestDraining(t *testing.T) {
 	certificate, roots := endpointCertificate(t)
 	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -1878,15 +2387,65 @@ func TestDrain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	drainCtx, drainCancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	concrete := client.(*clientEndpoint)
+	concrete.mu.Lock()
+	concrete.reconnecting = true // Keep the suspended session available for the drain test's explicit resume.
+	concrete.mu.Unlock()
+	serverSession := endpoint.Sessions()[0].(*sessionRecord)
+	if err := closeCurrentTransport(serverSession, "suspend before drain"); err != nil {
+		t.Fatal(err)
+	}
+	waitForSessionState(t, ctx, concrete.session, Suspended, 1)
+	waitForSessionState(t, ctx, serverSession, Suspended, 1)
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer drainCancel()
-	if err := server.Drain(drainCtx); err != context.DeadlineExceeded {
-		t.Fatalf("Drain = %v", err)
+	drainDone := make(chan error, 1)
+	go func() { drainDone <- server.Drain(drainCtx) }()
+	for {
+		endpoint.mu.Lock()
+		draining := endpoint.draining
+		endpoint.mu.Unlock()
+		if draining {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("server did not enter draining state")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	newAdmissionCtx, cancelNewAdmission := context.WithTimeout(context.Background(), time.Second)
+	defer cancelNewAdmission()
+	if extra, err := Dial(newAdmissionCtx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}}); err == nil {
+		_ = extra.Close(context.Background())
+		t.Fatal("new admission unexpectedly succeeded while draining")
+	}
+	attachment, err := concrete.openResume(ctx)
+	if err != nil {
+		t.Fatalf("resume during drain = %v", err)
+	}
+	if err := concrete.attachResume(attachment); err != nil {
+		t.Fatalf("attach during drain = %v", err)
+	}
+	concrete.mu.Lock()
+	concrete.reconnecting = false
+	concrete.mu.Unlock()
+	waitForSessionState(t, ctx, concrete.session, Active, 2)
+	waitForSessionState(t, ctx, serverSession, Active, 2)
+	select {
+	case err := <-drainDone:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Drain = %v, want deadline exceeded", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("drain did not reach its deadline")
 	}
 	select {
 	case <-client.Session().Context().Done():
-	case <-time.After(time.Second):
-		t.Fatal("drain did not close active session")
+	case <-ctx.Done():
+		t.Fatal("drain did not close resumed active session")
 	}
 	emptyCtx, emptyCancel := context.WithTimeout(context.Background(), time.Second)
 	defer emptyCancel()

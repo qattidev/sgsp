@@ -24,6 +24,7 @@ fi
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd -- "$script_dir/.." && pwd)
+cd "$root"
 artifacts=${1:-"$root/artifacts/$(date -u +%Y%m%dT%H%M%SZ)"}
 warmup=${SGSPBENCH_WARMUP:-10s}
 duration=${SGSPBENCH_DURATION:-60s}
@@ -33,6 +34,22 @@ gomaxprocs=${SGSPBENCH_GOMAXPROCS:-4}
 bin_dir="$artifacts/bin"
 raw_dir="$artifacts/raw"
 mkdir -p "$bin_dir" "$raw_dir"
+
+{
+  echo "timestamp_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "gomaxprocs=$gomaxprocs"
+  echo "go_version=$(go version)"
+  echo "go_env=$(go env GOOS GOARCH GOVERSION)"
+  echo "kernel=$(uname -sr)"
+  if command -v lscpu >/dev/null 2>&1; then
+    lscpu
+  fi
+  if command -v free >/dev/null 2>&1; then
+    free -b
+  fi
+  echo "modules:"
+  go list -m all
+} > "$artifacts/environment.txt"
 
 GOMAXPROCS="$gomaxprocs" go build -trimpath -o "$bin_dir/sgspbench" ./cmd/sgspbench
 GOMAXPROCS="$gomaxprocs" go build -trimpath -o "$bin_dir/sgspbenchreport" ./cmd/sgspbenchreport

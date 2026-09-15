@@ -21,7 +21,15 @@ GOCACHE=/tmp/sgsp-go-build go test -count=1 ./...        PASS
 GOCACHE=/tmp/sgsp-go-build go test -race -count=1 ./...  PASS
 GOCACHE=/tmp/sgsp-go-build go test -race -count=20 \
   -run 'Test(ConcurrentAssignment|AssignmentVersionAndClose)$' ./placement/...  PASS
+GOCACHE=/tmp/sgsp-go-build go test -race -count=20 ./placement ./placement/memory PASS
 GOCACHE=/tmp/sgsp-go-build go test -race -count=10 ./cmd/sgspbench            PASS
+GOCACHE=/tmp/sgsp-go-build go test -race -count=5 -run '^TestNATRebinding$' . PASS
+GOCACHE=/tmp/sgsp-go-build go test -race -count=5 -run '^TestUnknownRequestOutcome' . PASS
+GOCACHE=/tmp/sgsp-go-build go test -race -count=5 -run '^TestEpochFence$' .  PASS
+GOCACHE=/tmp/sgsp-go-build go test -race -count=5 -run '^TestDraining$' .    PASS
+GOCACHE=/tmp/sgsp-go-build go test -race -count=10 -run '^TestSlowConsumer$' . PASS
+GOCACHE=/tmp/sgsp-go-build go test -race -count=5 -run '^TestOwnerRestart$' . PASS
+GOCACHE=/tmp/sgsp-go-build go test -race -count=5 -run '^TestGroupCloseRace$' . PASS
 go vet ./...                                                                   PASS
 test -z "$(gofmt -l -- *.go internal/**/*.go examples/**/*.go cmd/**/*.go \
   placement/**/*.go 2>/dev/null)"                                             PASS
@@ -32,6 +40,12 @@ the 128 Hz update, operation-ID command, typed inventory response, raw stream,
 two concurrent grouped clients resolving to one of two live owners, a
 UDP-blackhole reconnect/resume, and terminal selected-owner shutdown. Its
 README contains the reproducible commands.
+
+`TestNATRebinding` uses the two-socket UDP relay to change only its
+server-facing source port. It observes the QUIC probe, `PATH_CHALLENGE`, and
+`PATH_RESPONSE` forwarding sequence without decoding packets, then verifies
+that traffic continues with the original SGSP session epoch. This records
+same-epoch NAT-rebinding support for the pinned QUIC adapter.
 
 The following specification gates are still incomplete and must not be
 reported as passed:
@@ -50,24 +64,30 @@ reported as passed:
 - broader terminal cleanup coverage from section 8. Barrier-driven
   100-candidate concurrent commit, real lost-WELCOME retry with an unseen
   epoch, positive and credential-bound resume cases, direct revocation,
-  pre-grace resume/post-grace expiry, a real-QUIC polling epoch-queue cleanup
-  test, a real-QUIC pending request/custom-stream loss cleanup test,
+  pre-grace resume/post-grace expiry, a real-QUIC polling epoch-fencing test
+  that discards epoch-1 work and delivers only resumed epoch-2 work, a
+  real-QUIC pending request/custom-stream loss cleanup test, a
+  real-QUIC committed-request loss/resume test that records `OutcomeUnknown`
+  without replaying the committed operation,
   interrupted reliable-stream loss handoff (which must not be relabeled as a
   protocol violation), and bounded expired-ID cache tests are present;
-- full 60-second decoder fuzz campaigns. A one-worker five-second
-  `FuzzControl` diagnostic completed successfully, but this runner stalled
-  before reaching a 60-second fuzz-time budget, so it is not recorded as the
-  required M1 fuzz evidence;
+- full 60-second decoder fuzz campaigns. One-worker five-second diagnostics
+  completed successfully for `FuzzControl`, `FuzzEvent`, and `FuzzRequest`.
+  An attempted 60-second `FuzzControl` campaign made 142,731 executions and
+  then stopped making progress before the execution environment ended without
+  a `PASS` result, so it is not recorded as the required M1 fuzz evidence;
 - PostgreSQL integration execution against a disposable service; the explicit
   migration runner and its local integrity checks compile, but no service was
   available here;
 - the M8 impairment matrix and published performance trial results.
   `cmd/sgspbench` now runs a bounded single SGSP or bare-QUIC trial through
   per-client deterministic two-socket UDP relays, exercising sequenced
-  input/update datagrams, request/reply, and paced raw-stream bulk data. It
-  records configuration, operation counts, relay state, and Go runtime data,
-  but the required five-trial matrix, plateau campaign, and published report
-  remain incomplete.
+  input/update datagrams, request/reply, and paced raw-stream bulk data.
+  `scripts/run-benchmark-matrix.sh` builds both binaries, captures environment
+  metadata, runs the configured five-seed matrix, and invokes
+  `cmd/sgspbenchreport` to index the JSON results. A 100 ms, one-client,
+  five-seed tooling smoke passed locally, but the required 60-second matrix,
+  plateau campaign, and published report remain incomplete.
 
 The UDP receive-buffer warning emitted by quic-go on this host (416 KiB versus
 its 7 MiB desired buffer) is environmental and remains recorded as a
