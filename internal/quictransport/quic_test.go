@@ -137,10 +137,10 @@ func TestQUICChannels(t *testing.T) {
 	if err != nil || string(got) != "ok" {
 		t.Fatalf("bidi reply %q, %v", got, err)
 	}
-	if stats := client.Stats(); stats.BytesSent == 0 || stats.BytesReceived == 0 {
+	if stats := client.Stats(); stats.BytesSent == 0 || stats.BytesReceived == 0 || stats.PacketsSent == 0 || stats.PacketsReceived == 0 {
 		t.Fatalf("client byte stats = %#v", stats)
 	}
-	if stats := server.Stats(); stats.BytesSent == 0 || stats.BytesReceived == 0 {
+	if stats := server.Stats(); stats.BytesSent == 0 || stats.BytesReceived == 0 || stats.PacketsSent == 0 || stats.PacketsReceived == 0 {
 		t.Fatalf("server byte stats = %#v", stats)
 	}
 

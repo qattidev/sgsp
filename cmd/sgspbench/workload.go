@@ -777,7 +777,12 @@ func runSGSPClient(ctx context.Context, cfg config, session sgsp.Session, counte
 			counters.requestOffered.Add(1)
 			response, err := session.Call(ctx, benchmarkRequestType, make([]byte, benchmarkRPCBytes))
 			if err != nil || len(response) != benchmarkRPCBytes {
-				counters.requestFailed.Add(1)
+				// The measurement cutoff can cancel a request after it has been
+				// offered but before its reply arrives. Keep that as an unmatched
+				// offered operation, not an application/transport failure.
+				if ctx.Err() == nil {
+					counters.requestFailed.Add(1)
+				}
 			} else {
 				counters.requestAccepted.Add(1)
 			}

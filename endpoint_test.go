@@ -30,6 +30,19 @@ type testAuthenticator struct {
 	refreshExpires time.Duration
 }
 
+type principalAuthenticator struct{}
+
+func (principalAuthenticator) Authenticate(_ context.Context, credential Credential) (Principal, error) {
+	switch string(credential.Data) {
+	case "issuer-a":
+		return Principal{Issuer: "issuer-a", Subject: "player", ExpiresAt: time.Now().Add(time.Minute)}, nil
+	case "issuer-b":
+		return Principal{Issuer: "issuer-b", Subject: "player", ExpiresAt: time.Now().Add(time.Minute)}, nil
+	default:
+		return Principal{}, ErrUnauthenticated
+	}
+}
+
 type countedReceiveStream struct {
 	reader bytes.Reader
 	reads  atomic.Int64
@@ -59,6 +72,49 @@ func (*countedBidiStream) Close() error                        { return nil }
 func (*countedBidiStream) CloseWrite() error                   { return nil }
 func (*countedBidiStream) Abort(uint64)                        {}
 func (*countedBidiStream) SetDeadline(time.Time) error         { return nil }
+
+type deadlineBlockingControlStream struct {
+	started       chan struct{}
+	unblock       chan struct{}
+	deadlines     []time.Time
+	deadlineCalls int
+}
+
+func newDeadlineBlockingControlStream() *deadlineBlockingControlStream {
+	return &deadlineBlockingControlStream{started: make(chan struct{}), unblock: make(chan struct{})}
+}
+func (s *deadlineBlockingControlStream) Read([]byte) (int, error) {
+	close(s.started)
+	<-s.unblock
+	return 0, context.DeadlineExceeded
+}
+func (*deadlineBlockingControlStream) Write(payload []byte) (int, error) { return len(payload), nil }
+func (s *deadlineBlockingControlStream) SetDeadline(deadline time.Time) error {
+	s.deadlineCalls++
+	s.deadlines = append(s.deadlines, deadline)
+	if !deadline.IsZero() {
+		close(s.unblock)
+	}
+	return nil
+}
+
+type blockingControlWriteStream struct {
+	started chan struct{}
+	unblock chan struct{}
+}
+
+func newBlockingControlWriteStream() *blockingControlWriteStream {
+	return &blockingControlWriteStream{started: make(chan struct{}, 1), unblock: make(chan struct{})}
+}
+func (*blockingControlWriteStream) Read([]byte) (int, error) { return 0, io.EOF }
+func (s *blockingControlWriteStream) Write(payload []byte) (int, error) {
+	select {
+	case s.started <- struct{}{}:
+	default:
+	}
+	<-s.unblock
+	return len(payload), nil
+}
 
 func (a *testAuthenticator) Authenticate(_ context.Context, credential Credential) (Principal, error) {
 	a.calls.Add(1)
@@ -150,7 +206,8 @@ func TestRejectedCredentialsNeverCreateSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	observations := &recordingObserver{values: make(chan Observation, 8)}
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}, Observer: observations})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,6 +228,19 @@ func TestRejectedCredentialsNeverCreateSession(t *testing.T) {
 	if len(server.Sessions()) != 0 {
 		t.Fatal("rejected credentials created an active session")
 	}
+	observationDeadline := time.NewTimer(2 * time.Second)
+	defer observationDeadline.Stop()
+	for {
+		select {
+		case observation := <-observations.values:
+			if observation.Name == "handshakes" && observation.Kind == "result" && observation.Code == Unauthenticated && observation.Value == 1 {
+				goto observed
+			}
+		case <-observationDeadline.C:
+			t.Fatal("missing unauthenticated handshake observation")
+		}
+	}
+observed:
 	stop()
 	if err := <-serveDone; err != nil {
 		t.Fatal(err)
@@ -233,6 +303,62 @@ func TestAdmissionBinding(t *testing.T) {
 		t.Fatal("group close did not close session")
 	}
 	_ = client.Close(context.Background())
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRevocation(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: principalAuthenticator{}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	dial := func(identity string) Client {
+		client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Credentials: func(context.Context) (Credential, error) {
+			return Credential{Scheme: "test", Data: []byte(identity)}, nil
+		}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return client
+	}
+	first, second, other := dial("issuer-a"), dial("issuer-a"), dial("issuer-b")
+	if err := server.Revoke(ctx, "issuer-a", "player"); err != nil {
+		t.Fatal(err)
+	}
+	for _, client := range []Client{first, second} {
+		select {
+		case <-client.Session().Context().Done():
+		case <-time.After(time.Second):
+			t.Fatal("revoked session remained active")
+		}
+		if client.Session().State() != Closed {
+			t.Fatalf("revoked session state = %v", client.Session().State())
+		}
+	}
+	if other.Session().State() != Active || other.Session().Principal().Issuer != "issuer-b" {
+		t.Fatalf("unrelated identity was revoked: %#v", other.Session())
+	}
+	if sessions := server.Sessions(); len(sessions) != 1 || sessions[0].Principal().Issuer != "issuer-b" {
+		t.Fatalf("remaining sessions = %#v", sessions)
+	}
+	_ = first.Close(context.Background())
+	_ = second.Close(context.Background())
+	_ = other.Close(context.Background())
 	stop()
 	if err := <-serveDone; err != nil {
 		t.Fatal(err)
@@ -798,12 +924,13 @@ func TestResumeIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	observations := &recordingObserver{values: make(chan Observation, 64)}
 	lifecycles := make(chan LifecycleKind, 3)
 	router := NewRouter()
 	if err := router.OnLifecycle(func(_ context.Context, incoming *Incoming) { lifecycles <- incoming.Lifecycle.Kind }); err != nil {
 		t.Fatal(err)
 	}
-	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Dispatch: DispatchConfig{Mode: Handlers, Router: router}})
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Dispatch: DispatchConfig{Mode: Handlers, Router: router}, Observer: observations})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -869,6 +996,124 @@ func TestResumeIdentity(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("missing Resumed lifecycle")
 	}
+	type observationKey struct {
+		kind string
+		code Code
+	}
+	resumeObservations := make(map[observationKey]float64)
+	handshakeResults := make(map[Code]float64)
+	observationDeadline := time.NewTimer(3 * time.Second)
+	defer observationDeadline.Stop()
+	for handshakeResults[Normal] < 2 ||
+		resumeObservations[observationKey{"attempt", Normal}] < 1 ||
+		resumeObservations[observationKey{"success", Normal}] < 1 ||
+		resumeObservations[observationKey{"superseded", SessionSuperseded}] < 1 {
+		select {
+		case observation := <-observations.values:
+			if observation.Name == "resumes" {
+				resumeObservations[observationKey{observation.Kind, observation.Code}] += observation.Value
+			}
+			if observation.Name == "handshakes" && observation.Kind == "result" {
+				handshakeResults[observation.Code] += observation.Value
+			}
+		case <-observationDeadline.C:
+			t.Fatalf("resume observations = %#v; handshake results = %#v", resumeObservations, handshakeResults)
+		}
+	}
+	_ = client.Close(context.Background())
+	stop()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestResumeCredentialBinding(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: principalAuthenticator{}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("issuer-a")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	concrete := client.(*clientEndpoint)
+	serverSession := endpoint.Sessions()[0].(*sessionRecord)
+	serverSession.mu.RLock()
+	originalOperations := serverSession.operations
+	serverSession.mu.RUnlock()
+
+	attempt := func(name string, credential []byte, app AppIdentity, limits limitMessage, mutate func(*resumeMessage)) {
+		t.Helper()
+		resumeCtx, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		attemptPacket, err := net.ListenPacket("udp", "[::]:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer attemptPacket.Close()
+		remote, err := net.ResolveUDPAddr("udp", concrete.endpoint.Address)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tlsConfig := concrete.config.TLS.Clone()
+		tlsConfig.ServerName = concrete.endpoint.ServerName
+		connection, err := quictransport.Dial(resumeCtx, attemptPacket, remote, transportConfig(tlsConfig, concrete.limits))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer connection.Close(uint64(Internal), "resume binding test")
+		stream, err := connection.OpenBidi(resumeCtx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, owner := concrete.session.ID(), concrete.session.Owner()
+		resume := resumeMessage{SessionID: hex.EncodeToString(id[:]), OwnerID: owner.ID, Incarnation: hex.EncodeToString(owner.Incarnation[:]), Secret: concrete.resumeSecret}
+		mutate(&resume)
+		channel := newControlChannel(stream)
+		hello := helloMessage{Op: "hello", Role: roleName(concrete.config.Role), App: app, Required: []string{"datagrams"}, Limits: limits, Credential: credentialMessage{Scheme: "test", Data: base64.RawURLEncoding.EncodeToString(credential)}, Resume: &resume}
+		if err := channel.write(hello); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := channel.read(resumeCtx, concrete.limits.ControlBytes); err == nil {
+			t.Fatalf("%s resume unexpectedly received a welcome", name)
+		}
+		serverSession.mu.RLock()
+		state, epoch, operations := serverSession.state, serverSession.epoch, serverSession.operations
+		serverSession.mu.RUnlock()
+		if state != Active || epoch != 1 || operations != originalOperations {
+			t.Fatalf("%s changed active session to state=%v epoch=%d operations=%T", name, state, epoch, operations)
+		}
+	}
+
+	validLimits := limitMessageFrom(concrete.limits)
+	attempt("subject", []byte("issuer-b"), concrete.config.App, validLimits, func(*resumeMessage) {})
+	attempt("secret", []byte("issuer-a"), concrete.config.App, validLimits, func(resume *resumeMessage) {
+		resume.Secret = base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+	})
+	attempt("owner", []byte("issuer-a"), concrete.config.App, validLimits, func(resume *resumeMessage) { resume.OwnerID = "other" })
+	attempt("incarnation", []byte("issuer-a"), concrete.config.App, validLimits, func(resume *resumeMessage) {
+		resume.Incarnation = hex.EncodeToString(make([]byte, len(Incarnation{})))
+	})
+	attempt("app", []byte("issuer-a"), AppIdentity{ID: "app", Version: "2"}, validLimits, func(*resumeMessage) {})
+	changedLimits := validLimits
+	changedLimits.MessageBytes--
+	attempt("limits", []byte("issuer-a"), concrete.config.App, changedLimits, func(*resumeMessage) {})
+
 	_ = client.Close(context.Background())
 	stop()
 	if err := <-serveDone; err != nil {
@@ -1404,6 +1649,70 @@ func TestOutgoingFrameReservationUsesGlobalBudget(t *testing.T) {
 	}
 }
 
+func TestControlReadUsesTransportDeadline(t *testing.T) {
+	stream := newDeadlineBlockingControlStream()
+	deadline := time.Now().Add(time.Second)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	_, err := newControlChannel(stream).read(ctx, wire.PreNegotiationControlBytes)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("control read error = %v", err)
+	}
+	if stream.deadlineCalls != 2 || len(stream.deadlines) != 2 || stream.deadlines[0].IsZero() || !stream.deadlines[1].IsZero() {
+		t.Fatalf("control deadlines = %#v", stream.deadlines)
+	}
+}
+
+func TestControlWriterBoundsQueuedFrames(t *testing.T) {
+	stream := newBlockingControlWriteStream()
+	channel := newControlChannel(stream)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var exhausted atomic.Int32
+	channel.startWriter(ctx, 64, 1, func() { exhausted.Add(1) })
+	defer channel.stopWriter()
+
+	first := make(chan error, 1)
+	go func() { first <- channel.write(closeAckMessage{Op: "close_ack"}) }()
+	select {
+	case <-stream.started:
+	case <-time.After(time.Second):
+		t.Fatal("control writer did not begin the first frame")
+	}
+	second := make(chan error, 1)
+	go func() { second <- channel.write(closeAckMessage{Op: "close_ack"}) }()
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for {
+		items, _ := channel.queue.Len()
+		if items == 1 {
+			break
+		}
+		select {
+		case <-time.After(time.Millisecond):
+		case <-deadline.C:
+			t.Fatal("second control frame was not queued")
+		}
+	}
+	if err := channel.write(closeAckMessage{Op: "close_ack"}); err != ErrBackpressure {
+		t.Fatalf("full control queue write = %v", err)
+	}
+	if exhausted.Load() != 1 {
+		t.Fatalf("control exhaustion callback count = %d", exhausted.Load())
+	}
+	close(stream.unblock)
+	for _, result := range []<-chan error{first, second} {
+		select {
+		case err := <-result:
+			if err != nil {
+				t.Fatalf("queued control write = %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("queued control write remained blocked")
+		}
+	}
+}
+
 func TestFrameReservationsUsePersistentDirectionalBudgets(t *testing.T) {
 	limits := DefaultLimits()
 	limits.QueueBytes = 64
@@ -1450,6 +1759,37 @@ func TestFrameReservationsUsePersistentDirectionalBudgets(t *testing.T) {
 		t.Fatalf("failed global reservation retained incoming charge: %d", used)
 	}
 	global.Release(128)
+}
+
+func TestReplyReservationSurvivesOrdinaryDirectionalPressure(t *testing.T) {
+	limits := DefaultLimits()
+	reserve := limits.MessageBytes + 32
+	limits.QueueBytes = 2 * reserve
+	session := newSessionRecord(SessionID{4}, Owner{}, "", Principal{}, limits, true, nil)
+	operations := &connectionOperations{session: session, applicationBudget: runtime.NewBudget(int64(2 * limits.QueueBytes))}
+
+	releaseOrdinary, err := operations.reserveApplicationBytes(reserve)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := operations.reserveApplicationBytes(1); err != ErrBackpressure {
+		t.Fatalf("ordinary incoming capacity = %v", err)
+	}
+	releaseReply, err := operations.reserveReplyApplicationBytes(reserve)
+	if err != nil {
+		t.Fatalf("reply reservation was unavailable behind ordinary pressure: %v", err)
+	}
+	if _, err := operations.reserveReplyApplicationBytes(1); err != ErrBackpressure {
+		t.Fatalf("reply reservation exceeded directional capacity: %v", err)
+	}
+	releaseReply()
+	releaseOrdinary()
+	if used := session.incomingBudget.Used(); used != 0 {
+		t.Fatalf("ordinary incoming charge retained %d bytes", used)
+	}
+	if used := session.incomingReplyBudget.Used(); used != 0 {
+		t.Fatalf("reply incoming charge retained %d bytes", used)
+	}
 }
 
 func waitForSessionState(t *testing.T, ctx context.Context, session Session, state State, minimumEpoch uint64) {
@@ -1572,6 +1912,12 @@ func TestReliableRateLimit(t *testing.T) {
 	if err := router.OnEvent(21, func(context.Context, *Incoming) { delivered <- struct{}{} }); err != nil {
 		t.Fatal(err)
 	}
+	if err := router.OnRequest(22, func(ctx context.Context, incoming *Incoming) { _ = incoming.Reply(ctx, []byte("ok")) }); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.OnStream(23, func(_ context.Context, incoming *Incoming) { _ = incoming.Stream.Close() }); err != nil {
+		t.Fatal(err)
+	}
 	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Limits: limits, Dispatch: DispatchConfig{Mode: Handlers, Router: router}})
 	if err != nil {
 		t.Fatal(err)
@@ -1608,6 +1954,38 @@ func TestReliableRateLimit(t *testing.T) {
 	}
 	if client.Session().State() != Closed {
 		t.Fatalf("client state = %v", client.Session().State())
+	}
+	requestClient, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Limits: limits, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response, err := requestClient.Session().Call(ctx, 22, []byte("first")); err != nil || string(response) != "ok" {
+		t.Fatalf("first request = %q, %v", response, err)
+	}
+	_, _ = requestClient.Session().Call(ctx, 22, []byte("second"))
+	select {
+	case <-requestClient.Session().Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("request rate limit did not close session")
+	}
+	streamClient, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Limits: limits, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := streamClient.Session().OpenStream(ctx, 23)
+	if err != nil {
+		t.Fatalf("first custom stream = %v", err)
+	}
+	_ = stream.Close()
+	_, _ = streamClient.Session().OpenStream(ctx, 23)
+	select {
+	case <-streamClient.Session().Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("custom-stream rate limit did not close session")
 	}
 	stop()
 	if err := <-serveDone; err != nil {

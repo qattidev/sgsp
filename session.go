@@ -40,16 +40,31 @@ type sessionRecord struct {
 	terminal   Code
 	// Directional budgets persist across resumed connections. They cover
 	// temporary library-owned frames and reply bodies; queued incoming work is
-	// additionally charged by its dispatch queue.
-	incomingBudget *runtime.Budget
-	outgoingBudget *runtime.Budget
-	expiryTimer    *time.Timer
-	graceTimer     *time.Timer
+	// additionally charged by its dispatch queue. A full-size request reply has
+	// a separate reserve so ordinary traffic cannot deadlock Call completion.
+	incomingBudget, incomingReplyBudget *runtime.Budget
+	outgoingBudget, outgoingReplyBudget *runtime.Budget
+	expiryTimer                         *time.Timer
+	graceTimer                          *time.Timer
 }
 
 func newSessionRecord(id SessionID, owner Owner, group string, principal Principal, limits Limits, clientSide bool, operations sessionOperations) *sessionRecord {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &sessionRecord{id: id, owner: owner, group: group, principal: copyPrincipal(principal), ctx: ctx, cancel: cancel, state: Active, epoch: 1, limits: limits, clientSide: clientSide, operations: operations, incomingBudget: runtime.NewBudget(int64(limits.QueueBytes)), outgoingBudget: runtime.NewBudget(int64(limits.QueueBytes))}
+	ordinaryBytes, replyBytes := directionalBudgetLimits(limits)
+	return &sessionRecord{id: id, owner: owner, group: group, principal: copyPrincipal(principal), ctx: ctx, cancel: cancel, state: Active, epoch: 1, limits: limits, clientSide: clientSide, operations: operations, incomingBudget: runtime.NewBudget(ordinaryBytes), incomingReplyBudget: runtime.NewBudget(replyBytes), outgoingBudget: runtime.NewBudget(ordinaryBytes), outgoingReplyBudget: runtime.NewBudget(replyBytes)}
+}
+
+// directionalBudgetLimits leaves MessageBytes+32 bytes for one complete
+// response in each direction. New endpoints have already normalized
+// QueueBytes to at least twice that value. The fallback keeps direct internal
+// fixtures with deliberately tiny limits usable without overstating capacity.
+func directionalBudgetLimits(limits Limits) (ordinary, reply int64) {
+	total := int64(limits.QueueBytes)
+	reserve := int64(limits.MessageBytes + 32)
+	if total >= 2*reserve {
+		return total - reserve, reserve
+	}
+	return total, 0
 }
 
 func copyPrincipal(principal Principal) Principal {

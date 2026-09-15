@@ -109,6 +109,7 @@ type Incoming struct {
 	Lifecycle *Lifecycle
 
 	ctx        context.Context
+	enqueuedAt time.Time
 	release    func()
 	after      func()
 	reply      func(context.Context, []byte) error

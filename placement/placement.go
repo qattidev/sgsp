@@ -65,19 +65,47 @@ type BootstrapConfig struct {
 	Selector       Selector
 	Signer         AdmissionSigner
 	AuthorizeGroup sgsp.GroupAuthorizer
+	// Observer receives bounded, one-second aggregate placement observations.
+	// Call Bootstrap.Close during host shutdown to stop its observer worker.
+	Observer sgsp.Observer
 }
-type Bootstrap struct{ config BootstrapConfig }
+type Bootstrap struct {
+	config   BootstrapConfig
+	observer *observerQueue
+}
 
 func NewBootstrap(config BootstrapConfig) (*Bootstrap, error) {
 	if config.App.ID == "" || config.App.Version == "" || config.Registry == nil || config.Signer == nil {
 		return nil, sgsp.ErrInvalidArgument
 	}
-	return &Bootstrap{config: config}, nil
+	return &Bootstrap{config: config, observer: newObserverQueue(config.Observer)}, nil
+}
+
+// Close stops Bootstrap's optional observer worker. It does not close the
+// host-owned registry, store, or signer.
+func (b *Bootstrap) Close() {
+	if b != nil {
+		b.observer.Close()
+	}
+}
+
+// ObservationDrops reports aggregate observations that could not be delivered
+// because a host observer was too slow. It is local diagnostic data, not a
+// metric label.
+func (b *Bootstrap) ObservationDrops() uint64 {
+	if b == nil {
+		return 0
+	}
+	return b.observer.Dropped()
 }
 
 // Resolve picks or reads the durable group assignment, verifies that its
 // owner is currently admissible, and creates a short-lived owner-bound ticket.
-func (b *Bootstrap) Resolve(ctx context.Context, principal sgsp.Principal, groupKey string) (Placement, error) {
+func (b *Bootstrap) Resolve(ctx context.Context, principal sgsp.Principal, groupKey string) (placement Placement, resultErr error) {
+	if b != nil {
+		started := time.Now()
+		defer func() { b.observeResult("resolve", started, resultErr) }()
+	}
 	if b == nil || b.config.Registry == nil || b.config.Signer == nil || principal.Issuer == "" || principal.Subject == "" || !principal.ExpiresAt.After(time.Now()) {
 		return Placement{}, sgsp.ErrInvalidArgument
 	}
@@ -86,7 +114,9 @@ func (b *Bootstrap) Resolve(ctx context.Context, principal sgsp.Principal, group
 			return Placement{}, err
 		}
 	}
+	registryStarted := time.Now()
 	statuses, err := b.config.Registry.Snapshot(ctx)
+	b.observeResult("registry", registryStarted, err)
 	if err != nil {
 		return Placement{}, err
 	}
@@ -96,13 +126,13 @@ func (b *Bootstrap) Resolve(ctx context.Context, principal sgsp.Principal, group
 		if b.config.Store == nil {
 			return Placement{}, sgsp.ErrInvalidArgument
 		}
-		assignment, err := b.config.Store.Get(ctx, group)
+		assignment, err := b.readAssignment(ctx, group)
 		if errors.Is(err, ErrAssignmentNotFound) {
 			candidate, selectErr := selectOwner(ctx, principal, group, statuses, b.config.Selector)
 			if selectErr != nil {
 				return Placement{}, selectErr
 			}
-			assignment, err = b.config.Store.Assign(ctx, group, candidate)
+			assignment, err = b.assign(ctx, group, candidate)
 		}
 		if err != nil {
 			return Placement{}, err
@@ -136,11 +166,60 @@ func (b *Bootstrap) Resolve(ctx context.Context, principal sgsp.Principal, group
 	if !expiresAt.After(time.Now()) {
 		return Placement{}, sgsp.ErrUnauthenticated
 	}
+	signStarted := time.Now()
 	ticket, err := b.config.Signer.Sign(ctx, sgsp.Admission{App: b.config.App, PrincipalIssuer: principal.Issuer, Subject: principal.Subject, GroupKey: groupKey, Owner: owner, ExpiresAt: expiresAt})
+	b.observeResult("ticket", signStarted, err)
 	if err != nil {
 		return Placement{}, err
 	}
 	return Placement{Owner: owner, GroupKey: groupKey, AdmissionTicket: ticket, ExpiresAt: expiresAt}, nil
+}
+
+// CloseGroup closes the durable assignment only when it still belongs to the
+// supplied owner. Games can use it directly as ServerConfig.CommitGroupClose.
+func (b *Bootstrap) CloseGroup(ctx context.Context, groupKey string, owner sgsp.Owner) (resultErr error) {
+	if b == nil || b.config.Store == nil || groupKey == "" {
+		return sgsp.ErrInvalidArgument
+	}
+	started := time.Now()
+	defer func() { b.observeResult("close", started, resultErr) }()
+	return b.config.Store.Close(ctx, GroupID{App: b.config.App, Key: groupKey}, owner)
+}
+
+func (b *Bootstrap) readAssignment(ctx context.Context, group GroupID) (assignment Assignment, resultErr error) {
+	started := time.Now()
+	defer func() { b.observeResult("read", started, resultErr) }()
+	return b.config.Store.Get(ctx, group)
+}
+
+func (b *Bootstrap) assign(ctx context.Context, group GroupID, owner sgsp.Owner) (assignment Assignment, resultErr error) {
+	started := time.Now()
+	defer func() { b.observeResult("assign", started, resultErr) }()
+	return b.config.Store.Assign(ctx, group, owner)
+}
+
+func (b *Bootstrap) observeResult(kind string, started time.Time, resultErr error) {
+	if b == nil || b.observer == nil {
+		return
+	}
+	code := placementObservationCode(resultErr)
+	b.observer.Observe(kind, code, 1)
+	b.observer.Observe(placementHistogramKind(kind+"_latency", time.Since(started)), code, 1)
+}
+
+func placementObservationCode(err error) sgsp.Code {
+	if err == nil {
+		return sgsp.Normal
+	}
+	if errors.Is(err, ErrAssignmentNotFound) {
+		// A read miss is the normal branch before an initial assignment.
+		return sgsp.Normal
+	}
+	code := errorCode(err)
+	if code > sgsp.WrongMode {
+		return sgsp.Internal
+	}
+	return code
 }
 
 func selectOwner(ctx context.Context, principal sgsp.Principal, group GroupID, candidates []OwnerStatus, selector Selector) (sgsp.Owner, error) {

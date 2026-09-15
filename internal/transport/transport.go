@@ -17,6 +17,9 @@ type Stats struct {
 	DatagramsEnabled bool
 	BytesSent        uint64
 	BytesReceived    uint64
+	PacketsSent      uint64
+	PacketsReceived  uint64
+	PacketsLost      uint64
 }
 
 type BidiStream interface {

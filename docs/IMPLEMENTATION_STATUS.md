@@ -7,8 +7,12 @@ streams, polling dispatch, and bounded fixed-worker handler dispatch (with
 per-session serialization and queued sequenced-update coalescing), logical close acknowledgement,
 reconnect/resume, bounded terminal-ID and group-tombstone retention, placement
 interfaces, memory and PostgreSQL adapters with an explicit migration runner,
-one-second bounded observer aggregation for session, two-way event-message, and selected error signals,
-and the direct/bootstrap action example with a 128 Hz authoritative loop.
+one-second bounded observer aggregation for session-state, handshake/resume,
+authentication, message, queue, request/stream, protocol, transport, and
+optional Bootstrap placement signals, and the direct/bootstrap action example
+with a 128 Hz authoritative loop.
+Control-frame reads use the fixed control-reader task and transport deadlines;
+they do not spawn a helper goroutine per frame.
 
 Verified on 2026-09-15:
 
@@ -18,6 +22,9 @@ GOCACHE=/tmp/sgsp-go-build go test -race -count=1 ./...  PASS
 GOCACHE=/tmp/sgsp-go-build go test -race -count=20 \
   -run 'Test(ConcurrentAssignment|AssignmentVersionAndClose)$' ./placement/...  PASS
 GOCACHE=/tmp/sgsp-go-build go test -race -count=10 ./cmd/sgspbench            PASS
+go vet ./...                                                                   PASS
+test -z "$(gofmt -l -- *.go internal/**/*.go examples/**/*.go cmd/**/*.go \
+  placement/**/*.go 2>/dev/null)"                                             PASS
 ```
 
 The action example has automated local-QUIC direct and bootstrap coverage:
@@ -29,28 +36,31 @@ README contains the reproducible commands.
 The following specification gates are still incomplete and must not be
 reported as passed:
 
-- complete aggregate application-budget accounting (outgoing/stream buffers),
-  reserved reply/control queue capacity, and the remaining rate-limit behavior
-  from section 10. Reliable event and request stream readers now reserve queue
-  and global-body capacity before consuming a declared payload, and `Call`
+- Reliable event and request stream readers reserve queue and
+  global-body capacity before consuming a declared payload, and `Call`
   response bodies reserve global capacity before allocation. Short-lived
   outbound frames and decoded `Call` bodies also reserve their separate,
-  resume-persistent per-session directional `QueueBytes` budgets. Both
-  dispatch modes wait through `SlowConsumerTimeout` for queued reliable work
-  and then close, but this does not complete the full gate;
+  resume-persistent per-session directional `QueueBytes` budgets; one maximum
+  request-reply body per direction has an exclusive reserve, while raw custom
+  streams avoid library-owned copy buffers. Control writes use their own
+  bounded per-connection queue and close with
+  `ResourceExhausted` on queue exhaustion. Both dispatch modes wait through
+  `SlowConsumerTimeout` for queued reliable work and then close, but this does
+  not complete the full gate;
 - broader terminal cleanup coverage from section 8. Barrier-driven
   100-candidate concurrent commit, real lost-WELCOME retry with an unseen
-  epoch, pre-grace resume/post-grace expiry, a real-QUIC polling epoch-queue
-  cleanup test, a real-QUIC pending request/custom-stream loss cleanup test,
+  epoch, positive and credential-bound resume cases, direct revocation,
+  pre-grace resume/post-grace expiry, a real-QUIC polling epoch-queue cleanup
+  test, a real-QUIC pending request/custom-stream loss cleanup test,
   interrupted reliable-stream loss handoff (which must not be relabeled as a
   protocol violation), and bounded expired-ID cache tests are present;
+- full 60-second decoder fuzz campaigns. A one-worker five-second
+  `FuzzControl` diagnostic completed successfully, but this runner stalled
+  before reaching a 60-second fuzz-time budget, so it is not recorded as the
+  required M1 fuzz evidence;
 - PostgreSQL integration execution against a disposable service; the explicit
   migration runner and its local integrity checks compile, but no service was
   available here;
-- full section-11 observation coverage: fixed duration histogram buckets plus
-  selected authentication/request latency and error signals are present, but
-  queue, remaining request, stream, placement, and transport signals are not
-  yet instrumented;
 - the M8 impairment matrix and published performance trial results.
   `cmd/sgspbench` now runs a bounded single SGSP or bare-QUIC trial through
   per-client deterministic two-socket UDP relays, exercising sequenced

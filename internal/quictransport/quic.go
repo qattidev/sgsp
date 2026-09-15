@@ -163,7 +163,7 @@ func (c *conn) RemoteAddr() net.Addr { return c.conn.RemoteAddr() }
 func (c *conn) Stats() transport.Stats {
 	state := c.conn.ConnectionState()
 	stats := c.conn.ConnectionStats()
-	return transport.Stats{RTT: stats.SmoothedRTT, DatagramsEnabled: state.SupportsDatagrams.Local && state.SupportsDatagrams.Remote, BytesSent: stats.BytesSent, BytesReceived: stats.BytesReceived}
+	return transport.Stats{RTT: stats.SmoothedRTT, DatagramsEnabled: state.SupportsDatagrams.Local && state.SupportsDatagrams.Remote, BytesSent: stats.BytesSent, BytesReceived: stats.BytesReceived, PacketsSent: stats.PacketsSent, PacketsReceived: stats.PacketsReceived, PacketsLost: stats.PacketsLost}
 }
 
 type bidi struct{ *quic.Stream }

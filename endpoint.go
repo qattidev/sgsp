@@ -17,6 +17,7 @@ import (
 	goruntime "runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -339,8 +340,20 @@ func (s *serverEndpoint) Serve(ctx context.Context, packet net.PacketConn) error
 	s.mu.Lock()
 	s.listener = listener
 	s.mu.Unlock()
+	observeCtx, stopObserving := context.WithCancel(ctx)
 	close(s.started)
+	if s.incoming != nil {
+		s.incoming.startObserving(ctx, s.observer)
+	}
+	if s.observer != nil {
+		s.workers.Add(1)
+		go func() {
+			defer s.workers.Done()
+			s.observeSessionStates(observeCtx)
+		}()
+	}
 	defer func() {
+		stopObserving()
 		_ = listener.Close()
 		for _, session := range s.Sessions() {
 			s.closeSession(session.(*sessionRecord), ServerUnavailable)
@@ -365,13 +378,16 @@ func (s *serverEndpoint) Serve(ctx context.Context, packet net.PacketConn) error
 			}
 			return err
 		}
+		s.observe("handshakes", "attempt", Normal, 1)
 		if !s.limiter.allow(connection.RemoteAddr()) {
+			s.observe("handshakes", "result", ResourceExhausted, 1)
 			_ = connection.Close(uint64(ResourceExhausted), "handshake rate exceeded")
 			continue
 		}
 		s.mu.Lock()
 		if s.pending >= s.limits.MaxPendingHandshakes {
 			s.mu.Unlock()
+			s.observe("handshakes", "result", ResourceExhausted, 1)
 			_ = connection.Close(uint64(ResourceExhausted), "too many pending handshakes")
 			continue
 		}
@@ -385,6 +401,14 @@ func (s *serverEndpoint) Serve(ctx context.Context, packet net.PacketConn) error
 	}
 }
 func (s *serverEndpoint) handleConnection(connection transport.Conn) {
+	var handshakeResult sync.Once
+	completeHandshake := func(code Code) {
+		handshakeResult.Do(func() { s.observe("handshakes", "result", code, 1) })
+	}
+	rejectHandshake := func(code Code, message string) {
+		completeHandshake(code)
+		_ = connection.Close(uint64(code), message)
+	}
 	var releasePending sync.Once
 	finishPending := func() {
 		releasePending.Do(func() { s.mu.Lock(); s.pending--; s.mu.Unlock() })
@@ -394,22 +418,22 @@ func (s *serverEndpoint) handleConnection(connection transport.Conn) {
 	defer cancel()
 	stream, err := connection.AcceptBidi(ctx)
 	if err != nil {
-		_ = connection.Close(uint64(ProtocolViolation), "missing control stream")
+		rejectHandshake(ProtocolViolation, "missing control stream")
 		return
 	}
 	channel := newControlChannel(stream)
 	control, err := channel.read(ctx, s.limits.ControlBytes)
 	if err != nil {
-		_ = connection.Close(uint64(ProtocolViolation), "invalid control")
+		rejectHandshake(ProtocolViolation, "invalid control")
 		return
 	}
 	if control.Op != "hello" {
-		_ = connection.Close(uint64(ProtocolViolation), "expected hello")
+		rejectHandshake(ProtocolViolation, "expected hello")
 		return
 	}
 	hello, err := parseHello(control)
 	if err != nil {
-		_ = connection.Close(uint64(ProtocolViolation), "invalid hello")
+		rejectHandshake(ProtocolViolation, "invalid hello")
 		return
 	}
 	supported := map[string]bool{}
@@ -417,24 +441,24 @@ func (s *serverEndpoint) handleConnection(connection transport.Conn) {
 		supported["datagrams"] = true
 	}
 	if err := wire.RequireCapabilities(control, supported); err != nil {
-		_ = connection.Close(uint64(UnsupportedCapability), "required capability unavailable")
+		rejectHandshake(UnsupportedCapability, "required capability unavailable")
 		return
 	}
 	if len(hello.Group) > s.limits.MaxGroupKeyBytes {
-		_ = connection.Close(uint64(InvalidArgument), "group key too large")
+		rejectHandshake(InvalidArgument, "group key too large")
 		return
 	}
 	if err := validateLimitMessage(hello.Limits); err != nil {
-		_ = connection.Close(uint64(InvalidArgument), "invalid receive limits")
+		rejectHandshake(InvalidArgument, "invalid receive limits")
 		return
 	}
 	if hello.Role != roleName(s.config.Role) || hello.App != s.config.App || !connection.Stats().DatagramsEnabled && s.config.Role == GameRole {
-		_ = connection.Close(uint64(UnsupportedCapability), "unsupported capability")
+		rejectHandshake(UnsupportedCapability, "unsupported capability")
 		return
 	}
 	credentialData, err := base64.RawURLEncoding.DecodeString(hello.Credential.Data)
 	if err != nil {
-		_ = connection.Close(uint64(Unauthenticated), "authentication failed")
+		rejectHandshake(Unauthenticated, "authentication failed")
 		return
 	}
 	authStarted := time.Now()
@@ -445,29 +469,29 @@ func (s *serverEndpoint) handleConnection(connection transport.Conn) {
 	}
 	s.observe("auth", histogramKind("verify", time.Since(authStarted)), authCode, 1)
 	if err != nil || principal.Issuer == "" || principal.Subject == "" || !principal.ExpiresAt.After(time.Now()) {
-		_ = connection.Close(uint64(Unauthenticated), "authentication failed")
+		rejectHandshake(Unauthenticated, "authentication failed")
 		return
 	}
 	finishPending()
 	if hello.Resume != nil {
-		s.resumeConnection(connection, channel, hello, principal)
+		s.resumeConnection(connection, channel, hello, principal, completeHandshake)
 		return
 	}
 	if err := s.authorizeAdmission(ctx, hello, principal); err != nil {
-		_ = connection.Close(uint64(Forbidden), "admission rejected")
+		rejectHandshake(Forbidden, "admission rejected")
 		return
 	}
 	secret := make([]byte, 32)
 	if s.config.Role == GameRole {
 		if _, err := rand.Read(secret); err != nil {
-			_ = connection.Close(uint64(Internal), "random failure")
+			rejectHandshake(Internal, "random failure")
 			return
 		}
 	}
 	var group *groupState
 	if hello.Group != "" {
 		if s.config.CommitGroupClose == nil {
-			_ = connection.Close(uint64(InvalidArgument), "group closure is not configured")
+			rejectHandshake(InvalidArgument, "group closure is not configured")
 			return
 		}
 		s.groupMu.Lock()
@@ -475,7 +499,7 @@ func (s *serverEndpoint) handleConnection(connection transport.Conn) {
 		if group == nil {
 			if len(s.groups) >= s.limits.MaxActiveGroups {
 				s.groupMu.Unlock()
-				_ = connection.Close(uint64(ResourceExhausted), "group capacity reached")
+				rejectHandshake(ResourceExhausted, "group capacity reached")
 				return
 			}
 			group = &groupState{sessions: make(map[*sessionRecord]struct{})}
@@ -483,7 +507,7 @@ func (s *serverEndpoint) handleConnection(connection transport.Conn) {
 		}
 		if group.closed {
 			s.groupMu.Unlock()
-			_ = connection.Close(uint64(GroupClosed), "group closed")
+			rejectHandshake(GroupClosed, "group closed")
 			return
 		}
 	}
@@ -493,7 +517,7 @@ func (s *serverEndpoint) handleConnection(connection transport.Conn) {
 		if group != nil {
 			s.groupMu.Unlock()
 		}
-		_ = connection.Close(uint64(ServerDraining), "server unavailable")
+		rejectHandshake(ServerDraining, "server unavailable")
 		return
 	}
 	var id SessionID
@@ -502,7 +526,7 @@ func (s *serverEndpoint) handleConnection(connection transport.Conn) {
 		if group != nil {
 			s.groupMu.Unlock()
 		}
-		_ = connection.Close(uint64(Internal), "random failure")
+		rejectHandshake(Internal, "random failure")
 		return
 	}
 	ops := &connectionOperations{connection: connection, control: channel, mode: s.config.Dispatch.Mode, incoming: s.incoming, scheduler: s.scheduler, applicationBudget: s.applicationBudget, observer: s.observer}
@@ -529,40 +553,47 @@ func (s *serverEndpoint) handleConnection(connection transport.Conn) {
 		welcome.Resumable, welcome.ResumeGraceMS, welcome.ResumeSecret = false, 0, ""
 	}
 	if err := channel.write(welcome); err != nil {
-		_ = connection.Close(uint64(Internal), "welcome failed")
+		rejectHandshake(Internal, "welcome failed")
 		return
 	}
+	completeHandshake(Normal)
 	ops.deliverLifecycle(Opened, Normal)
 	ops.startReceive()
 	ops.startControl()
 	<-connection.Context().Done()
 }
 
-func (s *serverEndpoint) resumeConnection(connection transport.Conn, channel *controlChannel, hello helloMessage, principal Principal) {
+func (s *serverEndpoint) resumeConnection(connection transport.Conn, channel *controlChannel, hello helloMessage, principal Principal, completeHandshake func(Code)) {
+	s.observe("resumes", "attempt", Normal, 1)
+	reject := func(code Code, message string) {
+		s.observe("resumes", "failure", code, 1)
+		completeHandshake(code)
+		_ = connection.Close(uint64(code), message)
+	}
 	if s.config.Role != GameRole || hello.Group != "" || hello.Admission != "" {
-		_ = connection.Close(uint64(Forbidden), "invalid resume")
+		reject(Forbidden, "invalid resume")
 		return
 	}
 	resume := *hello.Resume
 	id, err := parseSessionID(resume.SessionID)
 	if err != nil || resume.OwnerID != s.owner.ID || resume.Incarnation != hex.EncodeToString(s.owner.Incarnation[:]) {
-		_ = connection.Close(uint64(SessionNotFound), "unknown session")
+		reject(SessionNotFound, "unknown session")
 		return
 	}
 	secret, err := base64.RawURLEncoding.DecodeString(resume.Secret)
 	if err != nil || len(secret) != 32 {
-		_ = connection.Close(uint64(Unauthenticated), "invalid resume secret")
+		reject(Unauthenticated, "invalid resume secret")
 		return
 	}
 	session, terminal := s.lookupSession(id)
 	if session == nil {
-		_ = connection.Close(uint64(terminal), "unknown session")
+		reject(terminal, "unknown session")
 		return
 	}
 	groupKey := session.GroupKey()
 	if groupKey != "" {
 		if s.config.AuthorizeGroup == nil || s.config.AuthorizeGroup(connection.Context(), principal, groupKey) != nil {
-			_ = connection.Close(uint64(Forbidden), "resume authorization rejected")
+			reject(Forbidden, "resume authorization rejected")
 			return
 		}
 	}
@@ -574,7 +605,7 @@ func (s *serverEndpoint) resumeConnection(connection transport.Conn, channel *co
 		group = s.groups[groupKey]
 		if group == nil || group.closed {
 			s.groupMu.Unlock()
-			_ = connection.Close(uint64(GroupClosed), "group closed")
+			reject(GroupClosed, "group closed")
 			return
 		}
 	}
@@ -585,7 +616,7 @@ func (s *serverEndpoint) resumeConnection(connection transport.Conn, channel *co
 		if group != nil {
 			s.groupMu.Unlock()
 		}
-		_ = connection.Close(uint64(Unauthenticated), "resume rejected")
+		reject(Unauthenticated, "resume rejected")
 		return
 	}
 	if session.epoch == ^uint64(0) {
@@ -593,7 +624,7 @@ func (s *serverEndpoint) resumeConnection(connection transport.Conn, channel *co
 		if group != nil {
 			s.groupMu.Unlock()
 		}
-		_ = connection.Close(uint64(ResourceExhausted), "epoch exhausted")
+		reject(ResourceExhausted, "epoch exhausted")
 		return
 	}
 	previous, _ := session.operations.(*connectionOperations)
@@ -615,6 +646,7 @@ func (s *serverEndpoint) resumeConnection(connection transport.Conn, channel *co
 		return s.handleRefresh(ctx, session, control)
 	}
 	if previous != nil {
+		s.observe("resumes", "superseded", SessionSuperseded, 1)
 		previous.stopEpoch()
 		_ = previous.connection.Close(uint64(SessionSuperseded), "session superseded")
 	}
@@ -622,9 +654,11 @@ func (s *serverEndpoint) resumeConnection(connection transport.Conn, channel *co
 	defer s.finishConnection(session, ops)
 	welcome := welcomeMessage{Op: "welcome", SessionID: hex.EncodeToString(id[:]), Epoch: strconv.FormatUint(epoch, 10), Owner: ownerMessage{ID: s.owner.ID, Incarnation: hex.EncodeToString(s.owner.Incarnation[:]), Address: s.owner.Endpoint.Address, ServerName: s.owner.Endpoint.ServerName}, Principal: principalMessage{Issuer: principal.Issuer, Subject: principal.Subject, ExpiresMS: principal.ExpiresAt.UnixMilli()}, Limits: limitMessageFrom(s.limits), Capabilities: []string{"datagrams"}, Resumed: true, Resumable: true, ResumeGraceMS: int(s.limits.ResumeGrace / time.Millisecond)}
 	if err := channel.write(welcome); err != nil {
-		_ = connection.Close(uint64(Internal), "resume welcome failed")
+		reject(Internal, "resume welcome failed")
 		return
 	}
+	s.observe("resumes", "success", Normal, 1)
+	completeHandshake(Normal)
 	ops.deliverLifecycle(Resumed, Normal)
 	ops.startReceive()
 	ops.startControl()
@@ -683,7 +717,11 @@ func (s *serverEndpoint) Next(ctx context.Context) (*Incoming, error) {
 	if s.config.Dispatch.Mode != Polling {
 		return nil, ErrWrongMode
 	}
-	return s.incoming.Next(ctx)
+	incoming, err := s.incoming.Next(ctx)
+	if err == nil {
+		observeIncomingQueueAge(s.observer, incoming)
+	}
+	return incoming, err
 }
 func (s *serverEndpoint) Sessions() []Session {
 	s.mu.RLock()
@@ -769,7 +807,12 @@ func Dial(ctx context.Context, endpoint Endpoint, config ClientConfig) (Client, 
 	if config.TLS == nil || config.TLS.InsecureSkipVerify || config.Credentials == nil || config.App.ID == "" || config.App.Version == "" || endpoint.Address == "" || endpoint.ServerName == "" || len(config.GroupKey) > limits.MaxGroupKeyBytes || config.Dispatch.Mode == Polling && config.Dispatch.Router != nil || config.Dispatch.Mode == Handlers && config.Dispatch.Router == nil {
 		return nil, ErrInvalidArgument
 	}
-	credential, err := config.Credentials(ctx)
+	// Bound the complete client HELLO/WELCOME exchange even when the caller
+	// supplied a context without a deadline. controlChannel.read applies this
+	// deadline directly to the QUIC stream, avoiding a per-frame helper task.
+	handshakeCtx, cancelHandshake := context.WithTimeout(ctx, limits.AuthTimeout)
+	defer cancelHandshake()
+	credential, err := config.Credentials(handshakeCtx)
 	if err != nil {
 		return nil, err
 	}
@@ -783,12 +826,12 @@ func Dial(ctx context.Context, endpoint Endpoint, config ClientConfig) (Client, 
 	}
 	tlsConfig := config.TLS.Clone()
 	tlsConfig.ServerName = endpoint.ServerName
-	connection, err := quictransport.Dial(ctx, packet, remote, transportConfig(tlsConfig, limits))
+	connection, err := quictransport.Dial(handshakeCtx, packet, remote, transportConfig(tlsConfig, limits))
 	if err != nil {
 		_ = packet.Close()
 		return nil, err
 	}
-	stream, err := connection.OpenBidi(ctx)
+	stream, err := connection.OpenBidi(handshakeCtx)
 	if err != nil {
 		_ = connection.Close(uint64(Internal), "control stream")
 		_ = packet.Close()
@@ -804,7 +847,7 @@ func Dial(ctx context.Context, endpoint Endpoint, config ClientConfig) (Client, 
 		_ = packet.Close()
 		return nil, err
 	}
-	control, err := channel.read(ctx, limits.ControlBytes)
+	control, err := channel.read(handshakeCtx, limits.ControlBytes)
 	if err != nil {
 		_ = connection.Close(uint64(ProtocolViolation), "welcome failed")
 		_ = packet.Close()
@@ -888,7 +931,11 @@ func (c *clientEndpoint) Next(ctx context.Context) (*Incoming, error) {
 	if c.mode != Polling {
 		return nil, ErrWrongMode
 	}
-	return c.incoming.Next(ctx)
+	incoming, err := c.incoming.Next(ctx)
+	if err == nil {
+		observeIncomingQueueAge(c.observer, incoming)
+	}
+	return incoming, err
 }
 func (c *clientEndpoint) watchConnection(operations *connectionOperations) {
 	<-operations.connection.Context().Done()
@@ -1200,6 +1247,8 @@ type connectionOperations struct {
 	rateMu                                         sync.Mutex
 	rateTokens                                     float64
 	rateAt                                         time.Time
+	localDatagramDrops                             atomic.Uint64
+	staleUpdatesDropped                            atomic.Uint64
 }
 
 // incomingQueue owns polling-mode envelopes until the application releases
@@ -1210,6 +1259,7 @@ type incomingQueue struct {
 	queue             *runtime.Queue[*Incoming]
 	budget            *runtime.Budget
 	applicationBudget *runtime.Budget
+	observeOnce       sync.Once
 	mu                sync.Mutex
 	closed            bool
 	terminal          []*Incoming
@@ -1239,6 +1289,7 @@ func (r *reliableIncomingReservation) Commit(incoming *Incoming) bool {
 		return false
 	}
 	previous := incoming.release
+	incoming.enqueuedAt = time.Now()
 	incoming.release = func() {
 		if previous != nil {
 			previous()
@@ -1292,6 +1343,7 @@ func (q *incomingQueue) Push(incoming *Incoming, bytes int) bool {
 		return false
 	}
 	q.attachCharge(incoming, int64(bytes))
+	incoming.enqueuedAt = time.Now()
 	q.mu.Lock()
 	closed := q.closed
 	if !closed && q.queue.TryPush(runtime.Item[*Incoming]{Value: incoming, Bytes: bytes}) {
@@ -1314,6 +1366,7 @@ func (q *incomingQueue) PushWait(ctx context.Context, incoming *Incoming, bytes 
 		return err
 	}
 	q.attachCharge(incoming, int64(bytes))
+	incoming.enqueuedAt = time.Now()
 	q.mu.Lock()
 	closed := q.closed
 	q.mu.Unlock()
@@ -1396,6 +1449,40 @@ func (q *incomingQueue) attachCharge(incoming *Incoming, bytes int64) {
 		}
 	}
 }
+
+// startObserving samples one polling queue once per second. Server polling
+// queues are started by Serve, while a client starts its own queue from its
+// sole connection operation. sync.Once prevents per-session duplication when
+// a server owns a shared polling queue.
+func (q *incomingQueue) startObserving(ctx context.Context, observer *observerQueue) {
+	if q == nil || observer == nil || ctx == nil {
+		return
+	}
+	q.observeOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					q.observeUsage(observer)
+				}
+			}
+		}()
+	})
+}
+
+func (q *incomingQueue) observeUsage(observer *observerQueue) {
+	if q == nil || observer == nil || q.queue == nil {
+		return
+	}
+	items, bytes := q.queue.Len()
+	observer.Observe(Observation{Name: "queue_bytes", Kind: "in_polling", Code: Normal, Value: float64(bytes)})
+	observer.Observe(Observation{Name: "queue_items", Kind: "in_polling", Code: Normal, Value: float64(items)})
+}
+
 func (q *incomingQueue) Next(ctx context.Context) (*Incoming, error) {
 	if q == nil {
 		return nil, ErrSessionClosed
@@ -1496,6 +1583,9 @@ func (o *connectionOperations) stopEpoch() {
 	if stop != nil {
 		stop()
 	}
+	if o.control != nil {
+		o.control.stopWriter()
+	}
 	o.dropQueuedHandlers()
 	if o.mode == Polling {
 		o.incoming.discardEpoch(o.session, o.epoch)
@@ -1555,6 +1645,50 @@ func (o *connectionOperations) observe(name, kind string, code Code, value float
 		o.observer.Observe(Observation{Name: name, Kind: kind, Code: code, Value: value})
 	}
 }
+
+// observeMessage keeps message counts and payload bytes distinct while using
+// only fixed direction/delivery labels.
+func (o *connectionOperations) observeMessage(kind string, payloadBytes int) {
+	o.observe("messages", kind+"_count", Normal, 1)
+	o.observe("messages", kind+"_bytes", Normal, float64(payloadBytes))
+}
+
+func boundedObservationCode(code Code) Code {
+	if code > WrongMode {
+		return Internal
+	}
+	return code
+}
+
+func observationErrorCode(err error) Code {
+	if err == nil {
+		return Normal
+	}
+	var protocol *Error
+	if errors.As(err, &protocol) {
+		return boundedObservationCode(protocol.Code)
+	}
+	switch {
+	case errors.Is(err, context.Canceled):
+		return Canceled
+	case errors.Is(err, context.DeadlineExceeded):
+		return DeadlineExceeded
+	default:
+		return Internal
+	}
+}
+
+func (o *connectionOperations) dropDatagram(kind string, code Code, stale bool) {
+	if o == nil {
+		return
+	}
+	o.localDatagramDrops.Add(1)
+	if stale {
+		o.staleUpdatesDropped.Add(1)
+	}
+	o.observe("datagram_drop", kind, code, 1)
+}
+
 func (o *connectionOperations) observeDuration(name, kind string, code Code, duration time.Duration) {
 	o.observe(name, histogramKind(kind, duration), code, 1)
 }
@@ -1589,6 +1723,39 @@ func (o *connectionOperations) reserveDirectionalBytes(direction *runtime.Budget
 	}, nil
 }
 
+// reserveReplyDirectionalBytes first uses ordinary free capacity and falls
+// back to the per-direction reply reserve. Because ordinary capacity excludes
+// that reserve, the two ledgers together never exceed QueueBytes.
+func (o *connectionOperations) reserveReplyDirectionalBytes(ordinary, reply *runtime.Budget, bytes int) (func(), error) {
+	if o == nil || bytes < 0 {
+		return nil, ErrBackpressure
+	}
+	used := ordinary
+	if ordinary == nil || !ordinary.Acquire(int64(bytes)) {
+		used = reply
+		if reply != nil && !reply.Acquire(int64(bytes)) {
+			return nil, ErrBackpressure
+		}
+	}
+	if o.applicationBudget != nil && !o.applicationBudget.Acquire(int64(bytes)) {
+		if used != nil {
+			used.Release(int64(bytes))
+		}
+		return nil, ErrBackpressure
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			if o.applicationBudget != nil {
+				o.applicationBudget.Release(int64(bytes))
+			}
+			if used != nil {
+				used.Release(int64(bytes))
+			}
+		})
+	}, nil
+}
+
 // reserveApplicationBytes covers decoded Call replies before their bytes are
 // transferred to application ownership.
 func (o *connectionOperations) reserveApplicationBytes(bytes int) (func(), error) {
@@ -1599,6 +1766,14 @@ func (o *connectionOperations) reserveApplicationBytes(bytes int) (func(), error
 	return o.reserveDirectionalBytes(direction, bytes)
 }
 
+func (o *connectionOperations) reserveReplyApplicationBytes(bytes int) (func(), error) {
+	var ordinary, reply *runtime.Budget
+	if o != nil && o.session != nil {
+		ordinary, reply = o.session.incomingBudget, o.session.incomingReplyBudget
+	}
+	return o.reserveReplyDirectionalBytes(ordinary, reply, bytes)
+}
+
 // reserveOutgoing covers frames built from caller-owned payloads before the
 // transport has accepted them.
 func (o *connectionOperations) reserveOutgoing(bytes int) (func(), error) {
@@ -1607,6 +1782,14 @@ func (o *connectionOperations) reserveOutgoing(bytes int) (func(), error) {
 		direction = o.session.outgoingBudget
 	}
 	return o.reserveDirectionalBytes(direction, bytes)
+}
+
+func (o *connectionOperations) reserveOutgoingReply(bytes int) (func(), error) {
+	var ordinary, reply *runtime.Budget
+	if o != nil && o.session != nil {
+		ordinary, reply = o.session.outgoingBudget, o.session.outgoingReplyBudget
+	}
+	return o.reserveReplyDirectionalBytes(ordinary, reply, bytes)
 }
 func (o *connectionOperations) dispatch(incoming *Incoming) bool {
 	if !o.current() {
@@ -1654,6 +1837,7 @@ func (o *connectionOperations) enqueueHandler(incoming *Incoming) bool {
 	if o.handlerQueue == nil {
 		o.handlerQueue = runtime.NewQueue[*Incoming](o.session.limits.QueueBytes, o.session.limits.QueueMessages)
 	}
+	incoming.enqueuedAt = time.Now()
 	item := runtime.Item[*Incoming]{Value: incoming, Bytes: incomingCharge(incoming)}
 	accepted := false
 	if incoming.Delivery == UnreliableSequenced {
@@ -1662,6 +1846,7 @@ func (o *connectionOperations) enqueueHandler(incoming *Incoming) bool {
 		var replaced bool
 		accepted, previous, replaced = o.handlerQueue.ReplaceWith(item)
 		if accepted && replaced && previous.Value != nil {
+			o.dropDatagram("coalesced", Normal, false)
 			previous.Value.Release()
 		}
 	} else {
@@ -1705,6 +1890,7 @@ func (o *connectionOperations) enqueueReliableHandler(ctx context.Context, incom
 	if o.handlerQueue == nil {
 		o.handlerQueue = runtime.NewQueue[*Incoming](o.session.limits.QueueBytes, o.session.limits.QueueMessages)
 	}
+	incoming.enqueuedAt = time.Now()
 	item := runtime.Item[*Incoming]{Value: incoming, Bytes: incomingCharge(incoming)}
 	if !o.handlerQueue.TryPush(item) {
 		queue := o.handlerQueue
@@ -1800,7 +1986,7 @@ func (o *connectionOperations) reserveReliableIncoming(ctx context.Context, byte
 }
 
 func (o *connectionOperations) deliverReservedReliableEvent(event wire.Event, reservation *reliableIncomingReservation) error {
-	o.observe("messages", "in_reliable", Normal, float64(len(event.Payload)))
+	o.observeMessage("in_reliable", len(event.Payload))
 	incoming := &Incoming{Kind: Event, Session: o.session, Epoch: o.epoch, Type: MessageType(event.MessageType), Channel: ChannelID(event.Channel), Delivery: ReliableOrdered, Payload: event.Payload, ctx: o.context()}
 	if o.mode == Polling {
 		if o.incoming == nil || !reservation.Commit(incoming) {
@@ -1899,6 +2085,7 @@ func (o *connectionOperations) dropQueuedHandlers() {
 }
 
 func (o *connectionOperations) invoke(incoming *Incoming) {
+	o.observeQueuedIncoming(incoming)
 	defer func() {
 		if incoming.after != nil {
 			incoming.after()
@@ -1945,6 +2132,62 @@ func lifecycleObservationKind(kind LifecycleKind) string {
 		return "unknown"
 	}
 }
+
+func sessionStateObservationKind(state State) string {
+	switch state {
+	case Connecting:
+		return "state_connecting"
+	case Authenticating:
+		return "state_authenticating"
+	case Active:
+		return "state_active"
+	case Suspended:
+		return "state_suspended"
+	case Closed:
+		return "state_closed"
+	default:
+		return "state_unknown"
+	}
+}
+
+// observeSessionStates emits current server-side logical-session gauges. It
+// runs once per second outside transport and handler paths, and includes zero
+// values so a host can distinguish an absent state from a missing sample.
+func (s *serverEndpoint) observeSessionStates(ctx context.Context) {
+	if s == nil || s.observer == nil {
+		return
+	}
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		s.observeSessionStatesOnce()
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (s *serverEndpoint) observeSessionStatesOnce() {
+	if s == nil || s.observer == nil {
+		return
+	}
+	counts := map[State]uint64{
+		Connecting:     0,
+		Authenticating: 0,
+		Active:         0,
+		Suspended:      0,
+		Closed:         0,
+	}
+	for _, session := range s.Sessions() {
+		counts[session.State()]++
+	}
+	for _, state := range []State{Connecting, Authenticating, Active, Suspended, Closed} {
+		s.observe("sessions", sessionStateObservationKind(state), Normal, float64(counts[state]))
+	}
+}
+
 func (o *connectionOperations) deliverLifecycleAfter(kind LifecycleKind, reason Code, after func()) {
 	o.observe("sessions", lifecycleObservationKind(kind), reason, 1)
 	incoming := &Incoming{Kind: LifecycleMessage, Session: o.session, Epoch: o.epoch, Lifecycle: &Lifecycle{Kind: kind, Epoch: o.epoch, Reason: reason}, ctx: o.session.Context(), after: after}
@@ -1987,7 +2230,7 @@ func (o *connectionOperations) send(ctx context.Context, typ MessageType, payloa
 		}
 		_, err = stream.Write(frame)
 		if err == nil {
-			o.observe("messages", "out_reliable", Normal, float64(len(payload)))
+			o.observeMessage("out_reliable", len(payload))
 		}
 		return err
 	}
@@ -2019,7 +2262,7 @@ func (o *connectionOperations) send(ctx context.Context, typ MessageType, payloa
 		if options.Delivery == UnreliableSequenced {
 			kind = "out_sequenced"
 		}
-		o.observe("messages", kind, Normal, float64(len(payload)))
+		o.observeMessage(kind, len(payload))
 	}
 	return err
 }
@@ -2184,16 +2427,25 @@ func (o *connectionOperations) allowInboundMessage() bool {
 	return true
 }
 func (o *connectionOperations) call(ctx context.Context, typ MessageType, payload []byte) ([]byte, error) {
+	requestStarted := time.Now()
+	resultCode := Internal
+	defer func() {
+		o.observe("requests", "outbound_result", resultCode, 1)
+		o.observeDuration("requests", "outbound_latency", resultCode, time.Since(requestStarted))
+	}()
 	if !o.current() {
+		resultCode = SessionSuspended
 		return nil, ErrSessionSuspended
 	}
 	release, ok := o.acquireRequest(false)
 	if !ok {
+		resultCode = ResourceExhausted
 		return nil, ErrResourceExhausted
 	}
 	defer release()
 	releaseOutgoing, err := o.reserveOutgoing(len(payload) + 32)
 	if err != nil {
+		resultCode = observationErrorCode(err)
 		return nil, err
 	}
 	defer releaseOutgoing()
@@ -2204,6 +2456,7 @@ func (o *connectionOperations) call(ctx context.Context, typ MessageType, payloa
 		}
 	}
 	if timeout <= 0 {
+		resultCode = DeadlineExceeded
 		return nil, &Error{Code: DeadlineExceeded, Cause: context.DeadlineExceeded}
 	}
 	timeoutMS := uint64(timeout / time.Millisecond)
@@ -2212,24 +2465,30 @@ func (o *connectionOperations) call(ctx context.Context, typ MessageType, payloa
 	}
 	stream, err := o.connection.OpenBidi(ctx)
 	if err != nil {
+		resultCode = observationErrorCode(err)
 		return nil, err
 	}
 	request, err := wire.EncodeRequest(wire.Request{MessageType: uint64(typ), TimeoutMS: timeoutMS, Payload: payload}, o.outboundMessageLimit())
 	if err != nil {
 		_ = stream.Close()
-		return nil, mapWireError(err)
+		mapped := mapWireError(err)
+		resultCode = observationErrorCode(mapped)
+		return nil, mapped
 	}
 	written, err := stream.Write(request)
 	if err != nil {
 		_ = stream.Close()
 		if written > 0 {
-			return nil, unknownRequestOutcome(err)
+			resultCode = OutcomeUnknown
+			return nil, o.unknownRequestOutcome(err)
 		}
+		resultCode = observationErrorCode(err)
 		return nil, err
 	}
 	if err = stream.CloseWrite(); err != nil {
 		_ = stream.Close()
-		return nil, unknownRequestOutcome(err)
+		resultCode = OutcomeUnknown
+		return nil, o.unknownRequestOutcome(err)
 	}
 	result := make(chan struct {
 		response wire.Response
@@ -2269,7 +2528,7 @@ func (o *connectionOperations) call(ctx context.Context, typ MessageType, payloa
 			sendResult(responseResult{err: readErr})
 			return
 		}
-		releaseBody, reserveErr := o.reserveApplicationBytes(payloadBytes + 32)
+		releaseBody, reserveErr := o.reserveReplyApplicationBytes(payloadBytes + 32)
 		if reserveErr != nil {
 			sendResult(responseResult{err: reserveErr})
 			return
@@ -2304,21 +2563,32 @@ func (o *connectionOperations) call(ctx context.Context, typ MessageType, payloa
 		}
 		if result.err != nil {
 			if !result.complete {
-				return nil, unknownRequestOutcome(result.err)
+				resultCode = OutcomeUnknown
+				return nil, o.unknownRequestOutcome(result.err)
 			}
-			return nil, mapWireError(result.err)
+			mapped := mapWireError(result.err)
+			resultCode = observationErrorCode(mapped)
+			return nil, mapped
 		}
 		if result.response.Status != 0 {
+			resultCode = boundedObservationCode(Code(result.response.Status))
 			return nil, &Error{Code: Code(result.response.Status), Message: string(result.response.Payload)}
 		}
+		resultCode = Normal
 		return append([]byte(nil), result.response.Payload...), nil
 	case <-ctx.Done():
 		stream.Abort(uint64(Canceled))
-		return nil, unknownRequestOutcome(ctx.Err())
+		resultCode = OutcomeUnknown
+		return nil, o.unknownRequestOutcome(ctx.Err())
 	case <-o.context().Done():
 		stream.Abort(uint64(SessionClosed))
-		return nil, unknownRequestOutcome(context.Cause(o.context()))
+		resultCode = OutcomeUnknown
+		return nil, o.unknownRequestOutcome(context.Cause(o.context()))
 	}
+}
+func (o *connectionOperations) unknownRequestOutcome(cause error) error {
+	o.observe("requests", "unknown_outbound", OutcomeUnknown, 1)
+	return unknownRequestOutcome(cause)
 }
 func unknownRequestOutcome(cause error) error {
 	if cause == nil {
@@ -2365,7 +2635,9 @@ func (o *connectionOperations) openStream(ctx context.Context, typ MessageType) 
 		release()
 		return nil, err
 	}
-	reader := bufio.NewReader(stream)
+	// Do not buffer here: after the acceptance varint, any prefetched bytes
+	// would become an unaccounted per-stream allocation for the stream's life.
+	reader := streamByteReader{Reader: stream}
 	status, err := wire.ReadVarint(reader)
 	if err != nil {
 		stream.Abort(uint64(ProtocolViolation))
@@ -2482,23 +2754,138 @@ func (o *connectionOperations) close(ctx context.Context, code Code) error {
 	return nil
 }
 func (o *connectionOperations) stats() Stats {
+	if o == nil || o.connection == nil {
+		return Stats{}
+	}
 	stats := o.connection.Stats()
-	return Stats{RTT: stats.RTT, TransportStatsAvailable: true, BytesSent: stats.BytesSent, BytesReceived: stats.BytesReceived}
+	return Stats{RTT: stats.RTT, TransportStatsAvailable: true, BytesSent: stats.BytesSent, BytesReceived: stats.BytesReceived, LocalDatagramsDropped: o.localDatagramDrops.Load(), StaleUpdatesDropped: o.staleUpdatesDropped.Load()}
 }
 func (o *connectionOperations) startReceive() {
 	if o.session == nil {
 		return
 	}
 	o.startEpoch()
+	if o.mode == Polling && o.incoming != nil {
+		// A client polling queue survives a suspended epoch and is reused by a
+		// resumed connection, so bind its sampler to the logical session.
+		o.incoming.startObserving(o.session.Context(), o.observer)
+	}
 	go o.receiveDatagrams()
 	go o.acceptReliableStreams()
 	go o.acceptApplicationStreams()
+	go o.observeTransport()
+}
+
+// observeTransport is one fixed task per active connection. It reports
+// bounded transport counters, packet-loss gauge, and RTT histogram without
+// putting endpoint or session identifiers into observation labels. QUIC packet
+// loss is transport evidence only; it is not application-message loss.
+func (o *connectionOperations) observeTransport() {
+	if o == nil || o.connection == nil {
+		return
+	}
+	previous := o.connection.Stats()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-o.context().Done():
+			return
+		case <-ticker.C:
+			current := o.connection.Stats()
+			o.observeTransportSample(previous, current)
+			o.observeActiveOperations()
+			o.observeHandlerQueueUsage()
+			previous = current
+		}
+	}
+}
+
+func (o *connectionOperations) observeTransportSample(previous, current transport.Stats) {
+	if current.RTT > 0 {
+		o.observeDuration("transport", "rtt", Normal, current.RTT)
+	}
+	// quic-go's loss count can decrease when a packet declared lost later
+	// arrives, so report it as a current gauge rather than a counter delta.
+	o.observe("transport", "packets_lost", Normal, float64(current.PacketsLost))
+	if current.BytesSent > previous.BytesSent {
+		o.observe("transport", "bytes_sent", Normal, float64(current.BytesSent-previous.BytesSent))
+	}
+	if current.BytesReceived > previous.BytesReceived {
+		o.observe("transport", "bytes_received", Normal, float64(current.BytesReceived-previous.BytesReceived))
+	}
+}
+
+// observeActiveOperations samples bounded per-connection slot counters. The
+// endpoint observer aggregates same-label samples across connections, so no
+// session or application identifiers are exposed.
+func (o *connectionOperations) observeActiveOperations() {
+	if o == nil {
+		return
+	}
+	o.slotMu.Lock()
+	inRequests, outRequests := o.inRequests, o.outRequests
+	inStreams, outStreams := o.inStreams, o.outStreams
+	o.slotMu.Unlock()
+	o.observe("requests", "active_inbound", Normal, float64(inRequests))
+	o.observe("requests", "active_outbound", Normal, float64(outRequests))
+	o.observe("streams", "request_inbound", Normal, float64(inRequests))
+	o.observe("streams", "request_outbound", Normal, float64(outRequests))
+	o.observe("streams", "custom_inbound", Normal, float64(inStreams))
+	o.observe("streams", "custom_outbound", Normal, float64(outStreams))
+}
+
+func (o *connectionOperations) observeHandlerQueueUsage() {
+	if o == nil {
+		return
+	}
+	o.handlerMu.Lock()
+	queue := o.handlerQueue
+	o.handlerMu.Unlock()
+	if queue == nil {
+		return
+	}
+	items, bytes := queue.Len()
+	o.observe("queue_bytes", "in_handler", Normal, float64(bytes))
+	o.observe("queue_items", "in_handler", Normal, float64(items))
+}
+
+func (o *connectionOperations) observeQueuedIncoming(incoming *Incoming) {
+	if o == nil {
+		return
+	}
+	observeIncomingQueueAge(o.observer, incoming)
+}
+
+func observeIncomingQueueAge(observer *observerQueue, incoming *Incoming) {
+	if observer == nil || incoming == nil || incoming.enqueuedAt.IsZero() {
+		return
+	}
+	kind := "in_lifecycle"
+	switch incoming.Kind {
+	case Event:
+		kind = "in_event"
+	case RequestMessage:
+		kind = "in_request"
+	case StreamMessage:
+		kind = "in_stream"
+	}
+	age := time.Since(incoming.enqueuedAt)
+	if age < 0 {
+		age = 0
+	}
+	observer.Observe(Observation{Name: "queue_age", Kind: histogramKind(kind, age), Code: Normal, Value: 1})
 }
 func (o *connectionOperations) startControl() {
 	if o.session == nil || o.control == nil {
 		return
 	}
-	o.controlStart.Do(func() { go o.controlLoop() })
+	o.controlStart.Do(func() {
+		o.control.startWriter(o.connection.Context(), o.session.limits.ControlQueueBytes, o.session.limits.ControlQueueMessages, func() {
+			o.abortControl(ResourceExhausted)
+		})
+		go o.controlLoop()
+	})
 }
 func (o *connectionOperations) controlLoop() {
 	for {
@@ -2589,9 +2976,11 @@ func (o *connectionOperations) receiveDatagrams() {
 		}
 		event, err := wire.DecodeDatagram(datagram.Payload, o.session.limits.DatagramBytes)
 		if err != nil {
+			o.dropDatagram("invalid", ProtocolViolation, false)
 			continue
 		}
 		if !o.allowInboundMessage() {
+			o.dropDatagram("rate", ResourceExhausted, false)
 			continue
 		}
 		delivery := Unreliable
@@ -2614,6 +3003,7 @@ func (o *connectionOperations) receiveDatagrams() {
 			}
 			o.eventMu.Unlock()
 			if stale {
+				o.dropDatagram("stale", Normal, true)
 				continue
 			}
 		}
@@ -2732,6 +3122,7 @@ func (o *connectionOperations) readApplicationStream(stream transport.BidiStream
 			frame, _ := wire.EncodeResponse(wire.Response{Status: uint64(ResourceExhausted), Payload: []byte("message rate exceeded")}, o.session.limits.MessageBytes)
 			_, _ = stream.Write(frame)
 			_ = stream.Close()
+			_ = o.session.Close(context.Background(), ResourceExhausted)
 			return
 		}
 		release, ok := o.acquireRequest(true)
@@ -2752,6 +3143,7 @@ func (o *connectionOperations) readApplicationStream(stream transport.BidiStream
 		if !o.allowInboundMessage() {
 			_ = writeCustomAcceptance(stream, ResourceExhausted, "message rate exceeded")
 			_ = stream.Close()
+			_ = o.session.Close(context.Background(), ResourceExhausted)
 			return
 		}
 		if err := stream.SetDeadline(time.Time{}); err != nil {
@@ -2764,7 +3156,7 @@ func (o *connectionOperations) readApplicationStream(stream transport.BidiStream
 			_ = stream.Close()
 			return
 		}
-		o.readCustomStream(stream, bufio.NewReader(stream), MessageType(messageType), release)
+		o.readCustomStream(stream, stream, MessageType(messageType), release)
 	default:
 		stream.Abort(uint64(ProtocolViolation))
 		o.protocolViolation()
@@ -2814,13 +3206,16 @@ func (o *connectionOperations) readRequestStream(stream transport.BidiStream, re
 	completed := make(chan struct{})
 	var completeOnce sync.Once
 	respond := func(ctx context.Context, status Code, payload []byte) error {
-		resultCode := status
-		defer func() { o.observeDuration("requests", "latency", resultCode, time.Since(requestStarted)) }()
+		resultCode := boundedObservationCode(status)
+		defer func() {
+			o.observe("requests", "inbound_result", resultCode, 1)
+			o.observeDuration("requests", "inbound_latency", resultCode, time.Since(requestStarted))
+		}()
 		if err := ctx.Err(); err != nil {
-			resultCode = Internal
+			resultCode = observationErrorCode(err)
 			return err
 		}
-		releaseOutgoing, err := o.reserveOutgoing(len(payload) + 32)
+		releaseOutgoing, err := o.reserveOutgoingReply(len(payload) + 32)
 		if err != nil {
 			resultCode = Backpressure
 			return err
@@ -2886,7 +3281,7 @@ func (o *connectionOperations) readRequestStream(stream transport.BidiStream, re
 		}
 	}
 }
-func (o *connectionOperations) readCustomStream(stream transport.BidiStream, reader *bufio.Reader, typ MessageType, release func()) {
+func (o *connectionOperations) readCustomStream(stream transport.BidiStream, reader io.Reader, typ MessageType, release func()) {
 	application := &applicationStream{stream: stream, reader: reader, release: release}
 	incoming := &Incoming{Kind: StreamMessage, Session: o.session, Epoch: o.epoch, Type: typ, Stream: application, ctx: o.context()}
 	if o.mode == Polling {
@@ -2967,7 +3362,10 @@ func writeCustomAcceptance(stream transport.BidiStream, status Code, diagnostic 
 	_, err = stream.Write(frame)
 	return err
 }
-func readCustomDiagnostic(reader *bufio.Reader) ([]byte, error) {
+func readCustomDiagnostic(reader interface {
+	io.Reader
+	io.ByteReader
+}) ([]byte, error) {
 	length, err := wire.ReadVarint(reader)
 	if err != nil || length > 256 {
 		return nil, wire.ErrMalformed
@@ -2986,7 +3384,7 @@ func (o *connectionOperations) deliverEvent(event wire.Event) {
 	if event.Kind == wire.SequencedKind {
 		kind = "in_sequenced"
 	}
-	o.observe("messages", kind, Normal, float64(len(event.Payload)))
+	o.observeMessage(kind, len(event.Payload))
 	incoming := &Incoming{Kind: Event, Session: o.session, Epoch: o.epoch, Type: MessageType(event.MessageType), Channel: ChannelID(event.Channel), Payload: append([]byte(nil), event.Payload...), ctx: o.context()}
 	switch event.Kind {
 	case wire.UnreliableKind:
@@ -2997,6 +3395,9 @@ func (o *connectionOperations) deliverEvent(event wire.Event) {
 		incoming.Delivery = ReliableOrdered
 	}
 	if !o.dispatch(incoming) {
+		if o.current() {
+			o.dropDatagram("pressure", Backpressure, false)
+		}
 		incoming.Release()
 	}
 }
@@ -3216,29 +3617,183 @@ func parseSessionID(value string) (SessionID, error) {
 }
 
 type controlChannel struct {
-	reader  *bufio.Reader
-	writer  io.Writer
-	writeMu sync.Mutex
+	reader      *bufio.Reader
+	writer      io.Writer
+	setDeadline func(time.Time) error
+	writeMu     sync.Mutex
+	queueMu     sync.Mutex
+	queue       *runtime.Queue[*queuedControlFrame]
+	queueCtx    context.Context
+	queueCancel context.CancelFunc
+	closed      bool
+	exhausted   func()
+	exhaustOnce sync.Once
+}
+
+type queuedControlFrame struct {
+	payload []byte
+	done    chan error
 }
 
 func newControlChannel(stream interface {
 	io.Reader
 	io.Writer
 }) *controlChannel {
-	return &controlChannel{reader: bufio.NewReader(stream), writer: stream}
+	channel := &controlChannel{reader: bufio.NewReader(stream), writer: stream}
+	if deadlines, ok := stream.(interface{ SetDeadline(time.Time) error }); ok {
+		channel.setDeadline = deadlines.SetDeadline
+	}
+	return channel
 }
 func (c *controlChannel) read(ctx context.Context, max int) (wire.Control, error) {
-	return readControlReader(ctx, c.reader, max)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return wire.Control{}, err
+	}
+	if deadline, ok := ctx.Deadline(); ok && c.setDeadline != nil {
+		if err := c.setDeadline(deadline); err != nil {
+			return wire.Control{}, err
+		}
+		defer c.setDeadline(time.Time{})
+	}
+	return readControlReader(c.reader, max)
 }
 func (c *controlChannel) write(message any) error {
+	payload, err := encodeControl(message)
+	if err != nil {
+		return err
+	}
+	c.queueMu.Lock()
+	queue, queueCtx, closed := c.queue, c.queueCtx, c.closed
+	c.queueMu.Unlock()
+	if closed {
+		return context.Canceled
+	}
+	if queue == nil {
+		return c.writeFrame(payload)
+	}
+	frame := &queuedControlFrame{payload: payload, done: make(chan error, 1)}
+	if !queue.TryPush(runtime.Item[*queuedControlFrame]{Value: frame, Bytes: len(payload)}) {
+		c.exhaustOnce.Do(func() {
+			if c.exhausted != nil {
+				c.exhausted()
+			}
+		})
+		return ErrBackpressure
+	}
+	select {
+	case err := <-frame.done:
+		return err
+	case <-queueCtx.Done():
+		return context.Canceled
+	}
+}
+
+// startWriter enables the fixed per-connection control writer after the
+// handshake. Its bounded queue prevents blocked transport writes from turning
+// concurrent refresh/close paths into unbounded parked goroutines.
+func (c *controlChannel) startWriter(ctx context.Context, maxBytes, maxItems int, exhausted func()) {
+	if c == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if maxBytes < 1 {
+		maxBytes = 1
+	}
+	if maxItems < 1 {
+		maxItems = 1
+	}
+	c.queueMu.Lock()
+	if c.closed || c.queue != nil {
+		c.queueMu.Unlock()
+		return
+	}
+	queueCtx, cancel := context.WithCancel(ctx)
+	queue := runtime.NewQueue[*queuedControlFrame](maxBytes, maxItems)
+	c.queue, c.queueCtx, c.queueCancel, c.exhausted = queue, queueCtx, cancel, exhausted
+	c.queueMu.Unlock()
+	go c.writeLoop(queueCtx, queue)
+}
+
+func (c *controlChannel) stopWriter() {
+	if c == nil {
+		return
+	}
+	c.queueMu.Lock()
+	if c.closed {
+		c.queueMu.Unlock()
+		return
+	}
+	c.closed = true
+	queue, cancel := c.queue, c.queueCancel
+	c.queueMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if queue != nil {
+		queue.Close()
+		c.failQueuedControls(queue, context.Canceled)
+	}
+}
+
+func (c *controlChannel) writeLoop(ctx context.Context, queue *runtime.Queue[*queuedControlFrame]) {
+	defer c.failQueuedControls(queue, context.Canceled)
+	for {
+		frame, err := queue.WaitPop(ctx)
+		if err != nil {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			c.finishControlFrame(frame.Value, context.Canceled)
+			return
+		default:
+		}
+		if frame.Value == nil {
+			continue
+		}
+		c.finishControlFrame(frame.Value, c.writeFrame(frame.Value.payload))
+	}
+}
+
+func (c *controlChannel) failQueuedControls(queue *runtime.Queue[*queuedControlFrame], err error) {
+	if queue == nil {
+		return
+	}
+	for {
+		frame, ok := queue.Pop()
+		if !ok {
+			return
+		}
+		c.finishControlFrame(frame.Value, err)
+	}
+}
+
+func (c *controlChannel) finishControlFrame(frame *queuedControlFrame, err error) {
+	if frame == nil {
+		return
+	}
+	select {
+	case frame.done <- err:
+	default:
+	}
+}
+
+func (c *controlChannel) writeFrame(payload []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	return writeControl(c.writer, message)
+	written, err := c.writer.Write(payload)
+	if err == nil && written != len(payload) {
+		return io.ErrShortWrite
+	}
+	return err
 }
-func readControl(ctx context.Context, stream io.Reader, max int) (wire.Control, error) {
-	return readControlReader(ctx, bufio.NewReader(stream), max)
-}
-func readControlReader(ctx context.Context, reader *bufio.Reader, max int) (wire.Control, error) {
+
+func readControlReader(reader *bufio.Reader, max int) (wire.Control, error) {
 	length, err := wire.ReadVarint(reader)
 	if err != nil {
 		return wire.Control{}, err
@@ -3247,27 +3802,30 @@ func readControlReader(ctx context.Context, reader *bufio.Reader, max int) (wire
 		return wire.Control{}, ErrTooLarge
 	}
 	body := make([]byte, int(length))
-	done := make(chan error, 1)
-	go func() { _, err := io.ReadFull(reader, body); done <- err }()
-	select {
-	case err := <-done:
-		if err != nil {
-			return wire.Control{}, err
-		}
-		return wire.DecodeControlBody(body, max)
-	case <-ctx.Done():
-		return wire.Control{}, ctx.Err()
+	if _, err := io.ReadFull(reader, body); err != nil {
+		return wire.Control{}, err
 	}
+	return wire.DecodeControlBody(body, max)
 }
 func writeControl(stream io.Writer, message any) error {
-	raw, err := json.Marshal(message)
+	encoded, err := encodeControl(message)
 	if err != nil {
 		return err
+	}
+	written, err := stream.Write(encoded)
+	if err == nil && written != len(encoded) {
+		return io.ErrShortWrite
+	}
+	return err
+}
+func encodeControl(message any) ([]byte, error) {
+	raw, err := json.Marshal(message)
+	if err != nil {
+		return nil, err
 	}
 	encoded, err := wire.EncodeControl(raw, wire.PreNegotiationControlBytes)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	_, err = stream.Write(encoded)
-	return err
+	return encoded, nil
 }
