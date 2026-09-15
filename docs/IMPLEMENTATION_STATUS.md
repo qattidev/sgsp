@@ -30,6 +30,7 @@ GOCACHE=/tmp/sgsp-go-build go test -race -count=5 -run '^TestDraining$' .    PAS
 GOCACHE=/tmp/sgsp-go-build go test -race -count=10 -run '^TestSlowConsumer$' . PASS
 GOCACHE=/tmp/sgsp-go-build go test -race -count=5 -run '^TestOwnerRestart$' . PASS
 GOCACHE=/tmp/sgsp-go-build go test -race -count=5 -run '^TestGroupCloseRace$' . PASS
+GOCACHE=/tmp/sgsp-go-build go test -race -count=10 -run '^TestClientReconnectLoop$' . PASS
 go vet ./...                                                                   PASS
 test -z "$(gofmt -l -- *.go internal/**/*.go examples/**/*.go cmd/**/*.go \
   placement/**/*.go 2>/dev/null)"                                             PASS

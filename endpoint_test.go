@@ -33,6 +33,12 @@ type testAuthenticator struct {
 
 type principalAuthenticator struct{}
 
+type authenticatorFunc func(context.Context, Credential) (Principal, error)
+
+func (f authenticatorFunc) Authenticate(ctx context.Context, credential Credential) (Principal, error) {
+	return f(ctx, credential)
+}
+
 func (principalAuthenticator) Authenticate(_ context.Context, credential Credential) (Principal, error) {
 	switch string(credential.Data) {
 	case "issuer-a":
@@ -1411,6 +1417,72 @@ func TestOwnerRestart(t *testing.T) {
 	_ = client.Close(context.Background())
 	stopSecond()
 	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClientReconnectLoop(t *testing.T) {
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var authentications atomic.Int32
+	resumeAuthentication := make(chan struct{}, 1)
+	authenticator := authenticatorFunc(func(_ context.Context, credential Credential) (Principal, error) {
+		if string(credential.Data) != "valid" {
+			return Principal{}, ErrUnauthenticated
+		}
+		if authentications.Add(1) == 1 {
+			return Principal{Issuer: "test", Subject: "player", ExpiresAt: time.Now().Add(time.Minute)}, nil
+		}
+		select {
+		case resumeAuthentication <- struct{}{}:
+		default:
+		}
+		return Principal{}, ErrUnauthenticated
+	})
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: authenticator, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Credentials: func(context.Context) (Credential, error) {
+		return Credential{Scheme: "test", Data: []byte("valid")}, nil
+	}, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverSession := endpoint.Sessions()[0].(*sessionRecord)
+	if err := closeCurrentTransport(serverSession, "force reconnect"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-resumeAuthentication:
+	case <-ctx.Done():
+		t.Fatal("client did not make a resume authentication attempt")
+	}
+	select {
+	case <-client.Session().Context().Done():
+	case <-ctx.Done():
+		t.Fatal("terminal resume rejection did not end reconnect loop")
+	}
+	if code := client.(*clientEndpoint).session.terminalCode(); code != Unauthenticated {
+		t.Fatalf("terminal reconnect code = %v, want %v", code, Unauthenticated)
+	}
+	if calls := authentications.Load(); calls != 2 {
+		t.Fatalf("authentication calls = %d, want initial plus one terminal resume", calls)
+	}
+	_ = client.Close(context.Background())
+	stop()
+	if err := <-serveDone; err != nil {
 		t.Fatal(err)
 	}
 }

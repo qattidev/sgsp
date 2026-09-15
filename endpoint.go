@@ -1012,10 +1012,17 @@ func (c *clientEndpoint) reconnect() {
 		ctx, cancel := context.WithDeadline(context.Background(), attemptDeadline)
 		attachment, err := c.openResume(ctx)
 		cancel()
-		if err == nil && c.attachResume(attachment) == nil {
+		if err == nil {
+			err = c.attachResume(attachment)
+		}
+		if err == nil {
 			c.mu.Lock()
 			c.reconnecting = false
 			c.mu.Unlock()
+			return
+		}
+		if code, terminal := terminalResumeCode(err); terminal {
+			c.finishReconnect(code)
 			return
 		}
 		maximumDelay := c.limits.ReconnectMin << min(attempt, 3)
@@ -1039,11 +1046,26 @@ func (c *clientEndpoint) reconnect() {
 			return
 		}
 	}
+	c.finishReconnect(SessionExpired)
+}
+
+// terminalResumeCode identifies a server-issued rejection that cannot be
+// repaired by another network retry. Transport and deadline errors remain
+// retryable until the advertised grace deadline.
+func terminalResumeCode(err error) (Code, bool) {
+	var protocol *Error
+	if !errors.As(err, &protocol) || protocol == nil || !terminalCloseCode(protocol.Code) {
+		return Normal, false
+	}
+	return protocol.Code, true
+}
+
+func (c *clientEndpoint) finishReconnect(code Code) {
 	c.mu.Lock()
 	c.reconnecting = false
 	c.closed = true
 	c.mu.Unlock()
-	_ = c.session.Close(context.Background(), SessionExpired)
+	_ = c.session.Close(context.Background(), code)
 }
 
 func fullJitter(maximum time.Duration) time.Duration {
@@ -1103,6 +1125,16 @@ func (c *clientEndpoint) openResume(ctx context.Context) (resumeAttachment, erro
 	}
 	control, err := channel.read(ctx, c.limits.ControlBytes)
 	if err != nil {
+		// A stream read can wake just before quic-go publishes the connection's
+		// application-close cause. Wait for that terminal state (or this attempt's
+		// deadline) before deciding whether a server rejection is retryable.
+		select {
+		case <-connection.Context().Done():
+		case <-ctx.Done():
+		}
+		if value, ok := connection.CloseCode(); ok && terminalCloseCode(Code(value)) {
+			return fail(codeError(Code(value)))
+		}
 		_ = connection.Close(uint64(ProtocolViolation), "resume welcome failed")
 		return fail(err)
 	}
