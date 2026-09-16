@@ -129,9 +129,18 @@ reported as passed:
   20 of 20 recorded trials. It establishes only the configured one-client
   sweep. The corresponding eight-client healthy sweep also completed all
   20 of 20 trials under the same timing, rate, seed, and implementation
-  matrix, as did the 32-, 64-, and 128-client healthy sweeps. These local
-  points do not establish a multi-client capacity plateau; capacity doubling
-  beyond 128, the impairment sweep, and published report remain incomplete.
+  matrix, as did the 32-, 64-, and 128-client healthy sweeps. The original
+  serial high-client setup incorrectly charged connection establishment to
+  the measurement deadline and retained the normal per-IP admission rate;
+  `sgspbench` now scales those bounded loopback admission limits and
+  establishes benchmark clients concurrently before warmup. A corrected
+  256-client sweep also completed all 20 trials. At 64 clients and 128 Hz,
+  all five SGSP trials accepted and delivered nearly all generated workload
+  without relay overload. At 128 and 256 clients, 128 Hz SGSP update delivery
+  fell materially below the generated input volume, so 64 is the locally
+  observed healthy point and 32 is the selected impairment population. This
+  does not pass M8: the full impairment matrix, complete performance report,
+  and remaining release evidence are still incomplete.
 
 The UDP receive-buffer warning emitted by quic-go on this host (416 KiB versus
 its 7 MiB desired buffer) is environmental and remains recorded as a
