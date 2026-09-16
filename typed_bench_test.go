@@ -11,7 +11,10 @@ type codecBenchmarkValue struct {
 	Payload  string `json:"payload"`
 }
 
-var codecBenchmarkSink any
+var (
+	codecBenchmarkBytesSink []byte
+	codecBenchmarkValueSink codecBenchmarkValue
+)
 
 // BenchmarkCodecRawBytes measures the application-side work of using a
 // pre-encoded raw payload. It intentionally excludes SGSP framing and
@@ -21,7 +24,7 @@ func BenchmarkCodecRawBytes(b *testing.B) {
 	b.SetBytes(int64(len(payload)))
 	b.ReportAllocs()
 	for b.Loop() {
-		codecBenchmarkSink = payload
+		codecBenchmarkBytesSink = payload
 	}
 }
 
@@ -41,6 +44,6 @@ func BenchmarkCodecJSON(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		codecBenchmarkSink = decoded
+		codecBenchmarkValueSink = decoded
 	}
 }

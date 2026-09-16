@@ -14,13 +14,15 @@ with a 128 Hz authoritative loop.
 Control-frame reads use the fixed control-reader task and transport deadlines;
 they do not spawn a helper goroutine per frame.
 
-Verified on 2026-09-15:
+Verified through 2026-09-16:
 
 ```text
 GOCACHE=/tmp/sgsp-go-build go test -count=1 ./...        PASS
 GOCACHE=/tmp/sgsp-go-build go test -race -count=1 ./...  PASS
 GOCACHE=/tmp/sgsp-go-build go test -race -count=20 \
   -run 'Test(ConcurrentAssignment|AssignmentVersionAndClose)$' ./placement/...  PASS
+GOCACHE=/tmp/sgsp-go-build go -C integration/postgres test -race -count=20 \
+  -v ./...                                                                  PASS
 GOCACHE=/tmp/sgsp-go-build go test -race -count=20 ./placement ./placement/memory PASS
 GOCACHE=/tmp/sgsp-go-build go test -race -count=10 ./cmd/sgspbench            PASS
 GOCACHE=/tmp/sgsp-go-build go test -race -count=5 -run '^TestNATRebinding$' . PASS
@@ -29,6 +31,8 @@ GOCACHE=/tmp/sgsp-go-build go test -race -count=5 -run '^TestEpochFence' .   PAS
 GOCACHE=/tmp/sgsp-go-build go test -race -count=5 -run '^TestDraining$' .    PASS
 GOCACHE=/tmp/sgsp-go-build go test -race -count=10 -run '^TestSlowConsumer$' . PASS
 GOCACHE=/tmp/sgsp-go-build go test -race -count=5 -run '^TestOwnerRestart$' . PASS
+GOCACHE=/tmp/sgsp-go-build go test -race -count=100 \
+  -run 'Test(ConcurrentResume|EpochFence|LostResumeWelcome|DispatchOrdering)$' . PASS
 GOCACHE=/tmp/sgsp-go-build go test -race -count=5 -run '^TestGroupCloseRace$' . PASS
 GOCACHE=/tmp/sgsp-go-build go test -race -count=10 -run '^TestClientReconnectLoop$' . PASS
 GOCACHE=/tmp/sgsp-go-build go test -race -count=5 -run '^TestSessionAdmissionLimit$' . PASS
@@ -36,12 +40,20 @@ GOCACHE=/tmp/sgsp-go-build go test -race -count=20 -run '^TestTerminalIDCache' .
 GOCACHE=/tmp/sgsp-go-build go test -race -count=1 -run '^TestShutdownCleanup$' . PASS
 GOCACHE=/tmp/sgsp-go-build go test -count=10 \
   -run 'Test(ShutdownCleanup|SlowConsumer|GlobalBudget)$' ./...              PASS
+GOCACHE=/tmp/sgsp-go-build go test -run '^$' -bench '^BenchmarkCodec' \
+  -benchmem .                                                                 PASS
 GOMAXPROCS=1 GOCACHE=/tmp/sgsp-go-build go test ./internal/wire -run '^$' \
   -fuzz '^FuzzControl$' -fuzztime=60s -parallel=1                         PASS
 GOMAXPROCS=1 GOCACHE=/tmp/sgsp-go-build go test ./internal/wire -run '^$' \
+  -fuzz '^FuzzControl$' -fuzztime=10m -parallel=1                         PASS
+GOMAXPROCS=1 GOCACHE=/tmp/sgsp-go-build go test ./internal/wire -run '^$' \
   -fuzz '^FuzzEvent$' -fuzztime=60s -parallel=1                           PASS
 GOMAXPROCS=1 GOCACHE=/tmp/sgsp-go-build go test ./internal/wire -run '^$' \
+  -fuzz '^FuzzEvent$' -fuzztime=10m -parallel=1                           PASS
+GOMAXPROCS=1 GOCACHE=/tmp/sgsp-go-build go test ./internal/wire -run '^$' \
   -fuzz '^FuzzRequest$' -fuzztime=60s -parallel=1                         PASS
+GOMAXPROCS=1 GOCACHE=/tmp/sgsp-go-build go test ./internal/wire -run '^$' \
+  -fuzz '^FuzzRequest$' -fuzztime=10m -parallel=1                         PASS
 go vet ./...                                                                   PASS
 test -z "$(gofmt -l -- *.go internal/**/*.go examples/**/*.go cmd/**/*.go \
   placement/**/*.go 2>/dev/null)"                                             PASS
@@ -87,11 +99,6 @@ reported as passed:
   1,000-cycle shutdown-cleanup test (request, loss, explicit resume, close,
   no retained session/application budget, and post-GC heap tolerance) are
   present;
-- PostgreSQL integration execution against a disposable service; the explicit
-  migration runner and its local integrity checks compile, but no service was
-  available here. On 2026-09-15, `go -C integration/postgres test -race -v
-  ./...` reported the required explicit incomplete-check error for both SQL
-  cases because `SGSP_TEST_DATABASE_URL` is unset;
 - the M8 impairment matrix and published performance trial results.
   `cmd/sgspbench` now runs a bounded single SGSP or bare-QUIC trial through
   per-client deterministic two-socket UDP relays, exercising sequenced
@@ -103,7 +110,10 @@ reported as passed:
   `scripts/run-benchmark-matrix.sh` builds both binaries, captures environment
   metadata, runs the configured five-seed matrix, and invokes
   `cmd/sgspbenchreport` to index the JSON results. A 100 ms, one-client,
-  five-seed tooling smoke passed locally. A paired full 60-second pilot
+  five-seed tooling smoke passed locally. On 2026-09-16, a second 50 ms,
+  one-client script smoke completed all 20 trials (both implementations,
+  60/128 Hz, five seeds) and rendered timing, relay, runtime, and build-flag
+  metadata into temporary local artifacts. A paired full 60-second pilot
   (one client, 60 Hz, 20 ms RTT, seed 1, `GOMAXPROCS=1`) completed for both
   implementations with no failed operations, relay drops, or relay overload:
   SGSP accepted 3,601 inputs and delivered 3,600, accepted/delivered 3,600
@@ -113,7 +123,15 @@ reported as passed:
   measurement cutoff is deliberately not counted as a failure. These are
   local pilot artifacts only, not a published result. They cannot establish
   capacity or variance, so the required five-seed 60-second matrix, plateau
-  campaign, and published report remain incomplete.
+  campaign, and published report remain incomplete. A subsequent full
+  one-client healthy sweep (both implementations, 60/128 Hz, five seeds,
+  10-second warmup and 60-second measurement, `GOMAXPROCS=4`) completed all
+  20 of 20 recorded trials. It establishes only the configured one-client
+  sweep. The corresponding eight-client healthy sweep also completed all
+  20 of 20 trials under the same timing, rate, seed, and implementation
+  matrix, as did the 32-, 64-, and 128-client healthy sweeps. These local
+  points do not establish a multi-client capacity plateau; capacity doubling
+  beyond 128, the impairment sweep, and published report remain incomplete.
 
 The UDP receive-buffer warning emitted by quic-go on this host (416 KiB versus
 its 7 MiB desired buffer) is environmental and remains recorded as a

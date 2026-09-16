@@ -293,6 +293,12 @@ func runSGSPTrial(parent context.Context, cfg config) (result measurement, resul
 	limits := sgsp.DefaultLimits()
 	limits.MaxSessions = max(limits.MaxSessions, cfg.Clients)
 	limits.MaxPendingHandshakes = max(limits.MaxPendingHandshakes, cfg.Clients)
+	// Every benchmark client originates from loopback. Scale the admission
+	// rate limits with the configured population so that an intentional
+	// same-host setup does not mistake its single source address for an attack.
+	// These remain bounded limits; production defaults are unchanged.
+	limits.HandshakesPerIPPerSecond = max(limits.HandshakesPerIPPerSecond, cfg.Clients)
+	limits.HandshakeBurstPerIP = max(limits.HandshakeBurstPerIP, cfg.Clients)
 	serverRouter := benchmarkServerRouter(cfg, counters)
 	server, err := sgsp.NewServer(sgsp.ServerConfig{
 		TLS:      &tls.Config{Certificates: []tls.Certificate{certificate}},
@@ -316,42 +322,69 @@ func runSGSPTrial(parent context.Context, cfg config) (result measurement, resul
 		}
 	}()
 
-	trialCtx, cancelTrial := context.WithTimeout(parent, cfg.Warmup+cfg.Duration+10*time.Second)
-	defer cancelTrial()
 	type trialClient struct {
 		client sgsp.Client
 		relay  *udprelay.Relay
 	}
-	clients := make([]trialClient, 0, cfg.Clients)
+	clients := make([]trialClient, cfg.Clients)
 	defer func() {
 		closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 		for _, client := range clients {
-			_ = client.client.Close(closeCtx)
-			_ = client.relay.Close()
+			if client.client != nil {
+				_ = client.client.Close(closeCtx)
+			}
+			if client.relay != nil {
+				_ = client.relay.Close()
+			}
 		}
 	}()
-	for index := 0; index < cfg.Clients; index++ {
-		relay, err := udprelay.New("127.0.0.1:0", "127.0.0.1:0", serverPacket.LocalAddr(), udprelay.Config{RTT: cfg.RTT, Jitter: cfg.Jitter, Loss: cfg.Loss, Reorder: cfg.Reorder, Seed: uint64(cfg.Seed) + uint64(index)})
-		if err != nil {
-			return result, err
-		}
-		client, err := sgsp.Dial(trialCtx, sgsp.Endpoint{Address: relay.ClientAddr().String(), ServerName: "localhost"}, sgsp.ClientConfig{
-			TLS:              &tls.Config{RootCAs: roots},
-			App:              sgsp.AppIdentity{ID: "sgspbench", Version: "1"},
-			Limits:           limits,
-			DisableReconnect: true,
-			Credentials: func(context.Context) (sgsp.Credential, error) {
-				return sgsp.Credential{Scheme: "benchmark", Data: []byte("benchmark")}, nil
-			},
-			Dispatch: sgsp.DispatchConfig{Mode: sgsp.Handlers, Router: benchmarkClientRouter(counters, clock)},
+	setupCtx, cancelSetup := context.WithCancel(parent)
+	defer cancelSetup()
+	var setupOnce sync.Once
+	var setupErr error
+	var setupWorkers sync.WaitGroup
+	failSetup := func(err error) {
+		setupOnce.Do(func() {
+			setupErr = err
+			cancelSetup()
 		})
-		if err != nil {
-			_ = relay.Close()
-			return result, err
-		}
-		clients = append(clients, trialClient{client: client, relay: relay})
 	}
+	for index := 0; index < cfg.Clients; index++ {
+		index := index
+		setupWorkers.Add(1)
+		go func() {
+			defer setupWorkers.Done()
+			relay, err := udprelay.New("127.0.0.1:0", "127.0.0.1:0", serverPacket.LocalAddr(), udprelay.Config{RTT: cfg.RTT, Jitter: cfg.Jitter, Loss: cfg.Loss, Reorder: cfg.Reorder, Seed: uint64(cfg.Seed) + uint64(index)})
+			if err != nil {
+				failSetup(err)
+				return
+			}
+			client, err := sgsp.Dial(setupCtx, sgsp.Endpoint{Address: relay.ClientAddr().String(), ServerName: "localhost"}, sgsp.ClientConfig{
+				TLS:              &tls.Config{RootCAs: roots},
+				App:              sgsp.AppIdentity{ID: "sgspbench", Version: "1"},
+				Limits:           limits,
+				DisableReconnect: true,
+				Credentials: func(context.Context) (sgsp.Credential, error) {
+					return sgsp.Credential{Scheme: "benchmark", Data: []byte("benchmark")}, nil
+				},
+				Dispatch: sgsp.DispatchConfig{Mode: sgsp.Handlers, Router: benchmarkClientRouter(counters, clock)},
+			})
+			if err != nil {
+				_ = relay.Close()
+				failSetup(err)
+				return
+			}
+			clients[index] = trialClient{client: client, relay: relay}
+		}()
+	}
+	setupWorkers.Wait()
+	if setupErr != nil {
+		return result, setupErr
+	}
+
+	trialCtx, cancelTrial := context.WithTimeout(parent, cfg.Warmup+cfg.Duration+10*time.Second)
+	defer cancelTrial()
 
 	workCtx, stopWork := context.WithCancel(trialCtx)
 	var workers sync.WaitGroup
@@ -439,40 +472,70 @@ func runQUICTrial(parent context.Context, cfg config) (result measurement, resul
 		serverWorkers.Wait()
 	}()
 
-	trialCtx, cancelTrial := context.WithTimeout(parent, cfg.Warmup+cfg.Duration+10*time.Second)
-	defer cancelTrial()
 	type trialClient struct {
 		connection transport.Conn
 		packet     net.PacketConn
 		relay      *udprelay.Relay
 	}
-	clients := make([]trialClient, 0, cfg.Clients)
+	clients := make([]trialClient, cfg.Clients)
 	defer func() {
 		for _, client := range clients {
-			_ = client.connection.Close(uint64(sgsp.Normal), "benchmark complete")
-			_ = client.packet.Close()
-			_ = client.relay.Close()
+			if client.connection != nil {
+				_ = client.connection.Close(uint64(sgsp.Normal), "benchmark complete")
+			}
+			if client.packet != nil {
+				_ = client.packet.Close()
+			}
+			if client.relay != nil {
+				_ = client.relay.Close()
+			}
 		}
 	}()
-	for index := 0; index < cfg.Clients; index++ {
-		relay, err := udprelay.New("127.0.0.1:0", "127.0.0.1:0", serverPacket.LocalAddr(), udprelay.Config{RTT: cfg.RTT, Jitter: cfg.Jitter, Loss: cfg.Loss, Reorder: cfg.Reorder, Seed: uint64(cfg.Seed) + uint64(index)})
-		if err != nil {
-			return result, err
-		}
-		packet, err := net.ListenPacket("udp", "[::]:0")
-		if err != nil {
-			_ = relay.Close()
-			return result, err
-		}
-		tlsConfig := &tls.Config{RootCAs: roots, ServerName: "localhost"}
-		connection, err := quictransport.Dial(trialCtx, packet, relay.ClientAddr(), benchmarkTransportConfig(tlsConfig))
-		if err != nil {
-			_ = packet.Close()
-			_ = relay.Close()
-			return result, err
-		}
-		clients = append(clients, trialClient{connection: connection, packet: packet, relay: relay})
+	setupCtx, cancelSetup := context.WithCancel(parent)
+	defer cancelSetup()
+	var setupOnce sync.Once
+	var setupErr error
+	var setupWorkers sync.WaitGroup
+	failSetup := func(err error) {
+		setupOnce.Do(func() {
+			setupErr = err
+			cancelSetup()
+		})
 	}
+	for index := 0; index < cfg.Clients; index++ {
+		index := index
+		setupWorkers.Add(1)
+		go func() {
+			defer setupWorkers.Done()
+			relay, err := udprelay.New("127.0.0.1:0", "127.0.0.1:0", serverPacket.LocalAddr(), udprelay.Config{RTT: cfg.RTT, Jitter: cfg.Jitter, Loss: cfg.Loss, Reorder: cfg.Reorder, Seed: uint64(cfg.Seed) + uint64(index)})
+			if err != nil {
+				failSetup(err)
+				return
+			}
+			packet, err := net.ListenPacket("udp", "[::]:0")
+			if err != nil {
+				_ = relay.Close()
+				failSetup(err)
+				return
+			}
+			tlsConfig := &tls.Config{RootCAs: roots, ServerName: "localhost"}
+			connection, err := quictransport.Dial(setupCtx, packet, relay.ClientAddr(), benchmarkTransportConfig(tlsConfig))
+			if err != nil {
+				_ = packet.Close()
+				_ = relay.Close()
+				failSetup(err)
+				return
+			}
+			clients[index] = trialClient{connection: connection, packet: packet, relay: relay}
+		}()
+	}
+	setupWorkers.Wait()
+	if setupErr != nil {
+		return result, setupErr
+	}
+
+	trialCtx, cancelTrial := context.WithTimeout(parent, cfg.Warmup+cfg.Duration+10*time.Second)
+	defer cancelTrial()
 
 	workCtx, stopWork := context.WithCancel(trialCtx)
 	var workers sync.WaitGroup

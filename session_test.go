@@ -94,7 +94,7 @@ func TestSessionRecordRejectsInvalidCalls(t *testing.T) {
 	}
 }
 
-func TestConcurrentResume(t *testing.T) {
+func TestConcurrentResumeCommitLinearization(t *testing.T) {
 	principal := Principal{Issuer: "issuer", Subject: "subject", ExpiresAt: time.Now().Add(time.Minute)}
 	initial := &connectionOperations{}
 	session := newSessionRecord(SessionID{1}, Owner{ID: "owner"}, "", principal, DefaultLimits(), false, initial)

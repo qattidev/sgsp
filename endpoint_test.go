@@ -15,6 +15,7 @@ import (
 	"math/big"
 	"net"
 	goruntime "runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1485,6 +1486,124 @@ func TestClientReconnectLoop(t *testing.T) {
 	stop()
 	if err := <-serveDone; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestConcurrentResume(t *testing.T) {
+	const candidates = 100
+	certificate, roots := endpointCertificate(t)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{}, candidates)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAuth := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseAuth()
+	authenticator := authenticatorFunc(func(ctx context.Context, credential Credential) (Principal, error) {
+		switch string(credential.Data) {
+		case "initial":
+			return Principal{Issuer: "test", Subject: "player", ExpiresAt: time.Now().Add(time.Minute)}, nil
+		case "resume":
+			select {
+			case entered <- struct{}{}:
+			case <-ctx.Done():
+				return Principal{}, ctx.Err()
+			}
+			select {
+			case <-release:
+				return Principal{Issuer: "test", Subject: "player", ExpiresAt: time.Now().Add(time.Minute)}, nil
+			case <-ctx.Done():
+				return Principal{}, ctx.Err()
+			}
+		default:
+			return Principal{}, ErrUnauthenticated
+		}
+	})
+	limits := DefaultLimits()
+	limits.MaxPendingHandshakes = candidates
+	limits.HandshakesPerIPPerSecond = 100_000
+	limits.HandshakeBurstPerIP = 100_000
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: authenticator, Limits: limits, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := server.(*serverEndpoint)
+	serveCtx, stop := context.WithCancel(context.Background())
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx, packet) }()
+	<-endpoint.started
+	defer func() {
+		releaseAuth()
+		stop()
+		if err := <-serveDone; err != nil {
+			t.Error(err)
+		}
+	}()
+	var useResumeCredential atomic.Bool
+	credentials := func(context.Context) (Credential, error) {
+		if useResumeCredential.Load() {
+			return Credential{Scheme: "test", Data: []byte("resume")}, nil
+		}
+		return Credential{Scheme: "test", Data: []byte("initial")}, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Credentials: credentials, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close(context.Background())
+	concrete := client.(*clientEndpoint)
+	concrete.mu.Lock()
+	concrete.reconnecting = true // Candidate handshakes below deliberately replace this epoch.
+	concrete.mu.Unlock()
+	serverSession := endpoint.Sessions()[0].(*sessionRecord)
+	useResumeCredential.Store(true)
+	type candidate struct {
+		packet     net.PacketConn
+		connection transport.Conn
+		err        error
+	}
+	results := make(chan candidate, candidates)
+	start := make(chan struct{})
+	for range candidates {
+		go func() {
+			<-start
+			candidatePacket, connection, err := sendResumeAndDiscardWelcome(ctx, concrete)
+			results <- candidate{packet: candidatePacket, connection: connection, err: err}
+		}()
+	}
+	close(start)
+	connections := make([]candidate, 0, candidates)
+	for range candidates {
+		result := <-results
+		if result.err != nil {
+			t.Fatalf("candidate resume setup: %v", result.err)
+		}
+		connections = append(connections, result)
+	}
+	defer func() {
+		for _, candidate := range connections {
+			_ = candidate.connection.Close(uint64(SessionClosed), "test complete")
+			_ = candidate.packet.Close()
+		}
+	}()
+	for range candidates {
+		select {
+		case <-entered:
+		case <-ctx.Done():
+			t.Fatalf("authenticated resume barrier: %v", ctx.Err())
+		}
+	}
+	releaseAuth()
+	waitForSessionState(t, ctx, serverSession, Active, candidates+1)
+	if got, want := serverSession.Epoch(), uint64(candidates+1); got != want {
+		t.Fatalf("committed resume epoch = %d, want %d", got, want)
+	}
+	if sessions := endpoint.Sessions(); len(sessions) != 1 || sessions[0] != serverSession {
+		t.Fatalf("server sessions after concurrent resumes = %#v", sessions)
 	}
 }
 
