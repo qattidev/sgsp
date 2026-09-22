@@ -60,7 +60,7 @@ func TestRelayForwardsAndBlackholesDirections(t *testing.T) {
 	} else if network, ok := err.(net.Error); !ok || !network.Timeout() {
 		t.Fatalf("blackhole read error = %v", err)
 	}
-	if stats := relay.Stats(); stats.Forwarded < 2 || stats.Dropped < 1 || stats.PendingPackets != 0 || stats.PendingBytes != 0 {
+	if stats := relay.Stats(); stats.Forwarded < 2 || stats.Dropped < 1 || stats.PendingPackets != 0 || stats.PendingBytes != 0 || stats.PeakPendingPackets == 0 || stats.PeakPendingBytes == 0 {
 		t.Fatalf("relay stats = %#v", stats)
 	}
 }

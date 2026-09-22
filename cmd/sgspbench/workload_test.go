@@ -3,9 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
+
+	"qattidev/sgsp"
 )
 
 func TestCountWorkloadFailureExcludesMeasurementCutoff(t *testing.T) {
@@ -16,6 +19,63 @@ func TestCountWorkloadFailureExcludesMeasurementCutoff(t *testing.T) {
 	cancel()
 	if countWorkloadFailure(ctx, context.Canceled) {
 		t.Fatal("cutoff cancellation was counted as a workload failure")
+	}
+}
+
+func TestRequestOutcomeUnknown(t *testing.T) {
+	if !requestOutcomeUnknown(&sgsp.Error{Code: sgsp.OutcomeUnknown, OutcomeUnknown: true}) {
+		t.Fatal("SGSP unknown-outcome error was not classified")
+	}
+	if requestOutcomeUnknown(errors.New("ordinary request failure")) {
+		t.Fatal("ordinary error was classified as an unknown outcome")
+	}
+}
+
+func TestBareRequestOutcomeUnknown(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		requestWritten   int
+		completeResponse bool
+		want             bool
+	}{
+		{name: "pre-send failure", requestWritten: 0, want: false},
+		{name: "partial write", requestWritten: 1, want: true},
+		{name: "lost response", requestWritten: benchmarkRPCBytes, want: true},
+		{name: "complete response", requestWritten: benchmarkRPCBytes, completeResponse: true, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := bareRequestOutcomeUnknown(test.requestWritten, test.completeResponse); got != test.want {
+				t.Fatalf("bareRequestOutcomeUnknown(%d, %t) = %t, want %t", test.requestWritten, test.completeResponse, got, test.want)
+			}
+		})
+	}
+}
+
+func TestScheduledTickerCountsCoalescedTicks(t *testing.T) {
+	started := time.Unix(0, 0)
+	ticker := scheduledTicker{interval: 10 * time.Millisecond}
+	if missed := ticker.Observe(started); missed != 0 {
+		t.Fatalf("first scheduled tick missed %d intervals", missed)
+	}
+	if missed := ticker.Observe(started.Add(10 * time.Millisecond)); missed != 0 {
+		t.Fatalf("adjacent scheduled tick missed %d intervals", missed)
+	}
+	if missed := ticker.Observe(started.Add(40 * time.Millisecond)); missed != 2 {
+		t.Fatalf("coalesced scheduled ticks missed %d intervals, want 2", missed)
+	}
+}
+
+func TestBenchmarkWorkloadPhaseMarkers(t *testing.T) {
+	measured := benchmarkPayloadForClientPhase(32, 7, 9, 11, 3, true)
+	if !benchmarkPayloadIsMeasuredFromPayload(measured) {
+		t.Fatal("measurement payload did not retain its phase marker")
+	}
+	warmup := benchmarkPayloadForClientPhase(32, 7, 9, 11, 3, false)
+	if benchmarkPayloadIsMeasuredFromPayload(warmup) {
+		t.Fatal("warmup payload was marked as measured")
+	}
+	if !benchmarkRequestPayloadIsMeasured(benchmarkRequestPayload(true)) || benchmarkRequestPayloadIsMeasured(benchmarkRequestPayload(false)) {
+		t.Fatal("request phase marker was not preserved")
 	}
 }
 
@@ -34,6 +94,75 @@ func TestDurationHistogramUsesBoundedUpperBounds(t *testing.T) {
 	}
 }
 
+func TestDurationHistogramSeparatesOverflow(t *testing.T) {
+	histogram := &durationHistogram{}
+	histogram.Record(time.Microsecond)
+	histogram.Record(time.Microsecond + 1)
+	histogram.Record(time.Second)
+	histogram.Record(time.Second + time.Nanosecond)
+	summary := histogram.Snapshot()
+	if summary.Samples != 4 || summary.Overflow != 1 {
+		t.Fatalf("histogram samples/overflow = %d/%d", summary.Samples, summary.Overflow)
+	}
+	if !summary.P99Overflow || !summary.MaxOverflow || summary.MaxUpperBound != time.Second {
+		t.Fatalf("histogram overflow metadata = %#v", summary)
+	}
+	encoded, err := json.Marshal(summary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(encoded, []byte(`"overflow":1`)) || !bytes.Contains(encoded, []byte(`"max_overflow":true`)) {
+		t.Fatalf("histogram JSON does not identify overflow: %s", encoded)
+	}
+}
+
+func TestLocalOverheadCorrelatorPairsMatchingSequences(t *testing.T) {
+	combined := &durationHistogram{}
+	correlator := newLocalOverheadCorrelator(2, combined)
+	correlator.RecordReceive(7, 64*time.Microsecond) // stale warmup update
+	correlator.RecordSend(7, 8*time.Microsecond)
+	correlator.RecordReceive(7, 16*time.Microsecond)
+	correlator.RecordSend(10, time.Microsecond) // outside the fixed window
+
+	summary := correlator.Snapshot()
+	if summary.Sent != 1 || summary.Received != 1 || summary.Matched != 1 || summary.UnmatchedSent != 0 || summary.UnmatchedReceived != 0 {
+		t.Fatalf("correlation summary = %#v", summary)
+	}
+	if !summary.BufferOverflow {
+		t.Fatal("sequence outside the fixed correlation window did not invalidate the sample buffer")
+	}
+	if got := combined.Snapshot(); got.Samples != 1 || got.P99UpperBound < 24*time.Microsecond {
+		t.Fatalf("combined overhead histogram = %#v", got)
+	}
+}
+
+func TestNetworkAccumulatorSeparatesLocalDropCauses(t *testing.T) {
+	accumulator := &networkAccumulator{}
+	accumulator.addSGSP(sgsp.Stats{TransportStatsAvailable: true, RTT: 20 * time.Millisecond, LocalDatagramsDropped: 5, CoalescedDatagramsDropped: 2, StaleUpdatesDropped: 1})
+	accumulator.addSGSP(sgsp.Stats{TransportStatsAvailable: true, RTT: 30 * time.Millisecond, LocalDatagramsDropped: 3, CoalescedDatagramsDropped: 1, StaleUpdatesDropped: 2})
+	measurement := accumulator.Snapshot()
+	if !measurement.LocalDropMetricsAvailable || measurement.RTT.Samples != 2 || measurement.RTT.P99UpperBound < 30*time.Millisecond || measurement.LocalDatagramsDropped != 8 || measurement.CoalescedDatagramsDropped != 3 || measurement.StaleUpdatesDropped != 3 {
+		t.Fatalf("network measurement = %#v", measurement)
+	}
+}
+
+func TestBenchmarkObserverRecordsBoundedQueueMetrics(t *testing.T) {
+	observer := &benchmarkObserver{}
+	observer.Observe(sgsp.Observation{Name: "queue_items", Value: 3})
+	observer.Observe(sgsp.Observation{Name: "queue_items", Value: 2})
+	observer.Observe(sgsp.Observation{Name: "queue_bytes", Value: 128})
+	observer.Observe(sgsp.Observation{Name: "queue_age", Kind: "in_event_le_16us", Value: 4})
+	observer.Observe(sgsp.Observation{Name: "messages", Kind: "ignored", Value: 9})
+	measurement := observer.Snapshot()
+	if !measurement.Available || measurement.MaximumItems != 3 || measurement.MaximumBytes != 128 || measurement.AgeBuckets["in_event_le_16us"] != 4 || len(measurement.AgeBuckets) != 1 {
+		t.Fatalf("queue measurement = %#v", measurement)
+	}
+	observer.Reset()
+	if measurement := observer.Snapshot(); !measurement.Available || measurement.MaximumItems != 0 || measurement.MaximumBytes != 0 || len(measurement.AgeBuckets) != 0 {
+		t.Fatalf("queue measurement after reset = %#v", measurement)
+	}
+}
+
 func TestBenchmarkPayloadPreservesClockStamp(t *testing.T) {
 	payload := benchmarkPayload(24, 7, 9, 11)
 	tick, sequence, stamp, ok := benchmarkPayloadFields(payload)
@@ -42,6 +171,13 @@ func TestBenchmarkPayloadPreservesClockStamp(t *testing.T) {
 	}
 	if _, _, _, ok := benchmarkPayloadFields(payload[:23]); ok {
 		t.Fatal("truncated benchmark payload exposed a timestamp")
+	}
+	withClient := benchmarkPayloadForClient(32, 7, 9, 11, 3)
+	if clientIndex, ok := benchmarkPayloadClientIndex(withClient); !ok || clientIndex != 3 {
+		t.Fatalf("benchmark payload client index = %d/%t", clientIndex, ok)
+	}
+	if _, ok := benchmarkPayloadClientIndex(withClient[:31]); ok {
+		t.Fatal("truncated benchmark payload exposed a client index")
 	}
 }
 
@@ -61,8 +197,15 @@ func TestRunSGSPTrial(t *testing.T) {
 	if measurement.Relay.Overloaded {
 		t.Fatal("short trial overloaded relay")
 	}
-	if measurement.Timing.InputSendOverhead.Samples == 0 || measurement.Timing.UpdateAge.Samples == 0 {
+	if measurement.Timing.InputSendOverhead.Samples == 0 || measurement.Timing.InputReceiveOverhead.Samples == 0 || measurement.Timing.InputSendPlusReceive.Matched == 0 || measurement.Timing.UpdateSendOverhead.Samples == 0 || measurement.Timing.UpdateReceiveOverhead.Samples == 0 || measurement.Timing.UpdateSendPlusReceive.Matched == 0 || measurement.Timing.UpdateAge.Samples == 0 {
 		t.Fatalf("timing measurement = %#v", measurement.Timing)
+	}
+	if measurement.Validity.InputSampleBufferOverflow || measurement.Validity.UpdateSampleBufferOverflow {
+		t.Fatalf("short trial overflowed correlation buffer: %#v", measurement.Validity)
+	}
+	assertMeasurementCountsBounded(t, measurement)
+	if !measurement.Queues.Available || !measurement.Network.LocalDropMetricsAvailable {
+		t.Fatalf("SGSP-only metrics were unavailable: queues=%#v network=%#v", measurement.Queues, measurement.Network)
 	}
 }
 
@@ -82,8 +225,15 @@ func TestRunQUICTrial(t *testing.T) {
 	if measurement.Relay.Overloaded {
 		t.Fatal("short trial overloaded relay")
 	}
-	if measurement.Timing.InputSendOverhead.Samples == 0 || measurement.Timing.UpdateAge.Samples == 0 {
+	if measurement.Timing.InputSendOverhead.Samples == 0 || measurement.Timing.InputReceiveOverhead.Samples == 0 || measurement.Timing.InputSendPlusReceive.Matched == 0 || measurement.Timing.UpdateSendOverhead.Samples == 0 || measurement.Timing.UpdateReceiveOverhead.Samples == 0 || measurement.Timing.UpdateSendPlusReceive.Matched == 0 || measurement.Timing.UpdateAge.Samples == 0 {
 		t.Fatalf("timing measurement = %#v", measurement.Timing)
+	}
+	if measurement.Validity.InputSampleBufferOverflow || measurement.Validity.UpdateSampleBufferOverflow {
+		t.Fatalf("short trial overflowed correlation buffer: %#v", measurement.Validity)
+	}
+	assertMeasurementCountsBounded(t, measurement)
+	if measurement.Queues.Available || measurement.Network.LocalDropMetricsAvailable {
+		t.Fatalf("raw baseline fabricated SGSP-only metrics: queues=%#v network=%#v", measurement.Queues, measurement.Network)
 	}
 }
 
@@ -111,9 +261,24 @@ func TestTrialRequestsAndBulk(t *testing.T) {
 
 func TestCopyBenchmarkBulkCountsIncrementally(t *testing.T) {
 	counters := &trialCounters{}
-	copyBenchmarkBulk(bytes.NewBufferString("bulk"), counters)
+	counters.startMeasurement()
+	copyBenchmarkBulk(bytes.NewBufferString("bulk"), counters, true)
 	if got := counters.bulkDelivered.Load(); got != 4 {
 		t.Fatalf("delivered bulk bytes = %d", got)
+	}
+}
+
+func assertMeasurementCountsBounded(t *testing.T, measurement measurement) {
+	t.Helper()
+	for name, counts := range map[string]operationCounts{
+		"inputs":   measurement.Inputs,
+		"updates":  measurement.Updates,
+		"requests": measurement.Requests,
+		"bulk":     measurement.Bulk,
+	} {
+		if counts.Accepted > counts.Offered || counts.Delivered > counts.Offered {
+			t.Fatalf("%s crossed the measurement boundary: %#v", name, counts)
+		}
 	}
 }
 

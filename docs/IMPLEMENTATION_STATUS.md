@@ -14,7 +14,7 @@ with a 128 Hz authoritative loop.
 Control-frame reads use the fixed control-reader task and transport deadlines;
 they do not spawn a helper goroutine per frame.
 
-Verified through 2026-09-16:
+Historical verification through 2026-09-16:
 
 ```text
 GOCACHE=/tmp/sgsp-go-build go test -count=1 ./...        PASS
@@ -57,6 +57,17 @@ GOMAXPROCS=1 GOCACHE=/tmp/sgsp-go-build go test ./internal/wire -run '^$' \
 go vet ./...                                                                   PASS
 test -z "$(gofmt -l -- *.go internal/**/*.go examples/**/*.go cmd/**/*.go \
   placement/**/*.go 2>/dev/null)"                                             PASS
+```
+
+Additional verification on the current worktree, 2026-09-22:
+
+```text
+go test -count=1 ./...                                             PASS (82.818s)
+go test -race -count=1 -run '^(TestResumeGrace|TestResumeGraceHonorsEarlierAuthenticationExpiry)$' .
+                                                                      PASS (1.113s)
+go test -count=1 ./cmd/sgspbench ./cmd/sgspbenchreport              PASS (3.704s)
+go test -race -count=1 ./...                                        PASS (root 106.339s)
+go vet ./...                                                        PASS
 ```
 
 The action example has automated local-QUIC direct and bootstrap coverage:
@@ -103,8 +114,18 @@ reported as passed:
   `cmd/sgspbench` now runs a bounded single SGSP or bare-QUIC trial through
   per-client deterministic two-socket UDP relays, exercising sequenced
   input/update datagrams, request/reply, and paced raw-stream bulk data. Its
-  JSON uses bounded fixed-memory histograms for local input-send API-call
-  duration, successful request round trip, and same-process update age;
+  JSON uses bounded fixed-memory histograms for input/update API-to-adapter
+  handoff, decoded-frame-to-handler/poll-return receive overhead, successful
+  request round trip, and same-process update age. Fixed per-client sequence
+  buffers correlate both directional local budgets (client input send plus
+  server input receive, and server update send plus client update receive),
+  publish unmatched fractions, and invalidate a trial if either buffer
+  overflows. Results also separate transport RTT, local/coalesced/stale SGSP
+  drops, explicit unknown request outcomes, relay loss, and peak relay
+  backlog, plus queue occupancy maxima and bounded queue-age buckets;
+  the bare-QUIC baseline explicitly marks SGSP-only local-drop and dispatch
+  queue measurements unavailable instead of treating them as zero, while it
+  classifies post-write request failures as outcome-unknown;
   percentile fields are upper bounds rather than retained per-operation
   samples.
   `scripts/run-benchmark-matrix.sh` builds both binaries, captures environment
@@ -141,6 +162,29 @@ reported as passed:
   observed healthy point and 32 is the selected impairment population. This
   does not pass M8: the full impairment matrix, complete performance report,
   and remaining release evidence are still incomplete.
+
+Historical `/tmp` benchmark outputs are not retained evidence. The matrix
+runner now accepts only canonical paths below this checkout's `artifacts/`
+directory, retaining the built binaries, environment manifest, raw JSON, run
+log, campaign manifest, and rendered summary for every future campaign. The
+short 20-trial directional-overhead tooling smoke at
+`artifacts/directional-overhead-smoke-20260922/` confirms that this local
+record includes both paired directional distributions. Its 20/75 ms trial
+settings make it tooling evidence only, not a performance result.
+The subsequent 20-trial, one-client 50 ms warmup / 1.1 s measurement smoke at
+`artifacts/measurement-availability-smoke-20260922/` completed every trial
+and confirms that SGSP JSON records queue/local-drop availability while the
+bare-QUIC records render those library-only metrics as unavailable. It is
+also tooling evidence only, not a capacity result.
+
+`TestReconnectBlackholeDurations` now performs the required real UDP-relay
+blackholes for 2, 8, and 40 seconds. The locally retained JSON record at
+`artifacts/reconnect-blackhole-20260922-rerun/test.json` passed all three: the
+two-second outage kept epoch 1 active, the eight-second outage resumed at
+epoch 2 after 1.023 seconds, and the 40-second outage expired the session
+after 36.001 seconds.
+This is reconnect regression evidence, not a five-seed capacity or impairment
+matrix result.
 
 The UDP receive-buffer warning emitted by quic-go on this host (416 KiB versus
 its 7 MiB desired buffer) is environmental and remains recorded as a

@@ -110,9 +110,9 @@ type Stream interface {
 }
 
 type Stats struct {
-	RTT                                        time.Duration
-	TransportStatsAvailable                    bool
-	BytesSent, BytesReceived                   uint64
-	SendQueuedBytes, ReceiveQueuedBytes        int64
-	LocalDatagramsDropped, StaleUpdatesDropped uint64
+	RTT                                                                   time.Duration
+	TransportStatsAvailable                                               bool
+	BytesSent, BytesReceived                                              uint64
+	SendQueuedBytes, ReceiveQueuedBytes                                   int64
+	LocalDatagramsDropped, CoalescedDatagramsDropped, StaleUpdatesDropped uint64
 }

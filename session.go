@@ -3,7 +3,6 @@ package sgsp
 import (
 	"context"
 	"sync"
-	"time"
 
 	"qattidev/sgsp/internal/runtime"
 )
@@ -44,8 +43,8 @@ type sessionRecord struct {
 	// a separate reserve so ordinary traffic cannot deadlock Call completion.
 	incomingBudget, incomingReplyBudget *runtime.Budget
 	outgoingBudget, outgoingReplyBudget *runtime.Budget
-	expiryTimer                         *time.Timer
-	graceTimer                          *time.Timer
+	expiryTimer                         endpointTimer
+	graceTimer                          endpointTimer
 }
 
 func newSessionRecord(id SessionID, owner Owner, group string, principal Principal, limits Limits, clientSide bool, operations sessionOperations) *sessionRecord {

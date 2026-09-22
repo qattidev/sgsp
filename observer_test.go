@@ -139,26 +139,30 @@ func TestTransportObservationsUseBoundedCountersAndRTTBuckets(t *testing.T) {
 }
 
 func TestDatagramDropAccounting(t *testing.T) {
-	observer := &recordingObserver{values: make(chan Observation, 2)}
+	observer := &recordingObserver{values: make(chan Observation, 3)}
 	queue := newObserverQueue(observer, 4, time.Millisecond)
 	defer queue.Close()
 	operations := &connectionOperations{observer: queue, connection: staticStatsConnection{stats: transport.Stats{BytesSent: 7, BytesReceived: 11}}}
 	operations.dropDatagram("pressure", Backpressure, false)
+	operations.dropDatagram("coalesced", Normal, false)
 	operations.dropDatagram("stale", Normal, true)
-	if got := operations.localDatagramDrops.Load(); got != 2 {
+	if got := operations.localDatagramDrops.Load(); got != 3 {
 		t.Fatalf("local datagram drops = %d", got)
+	}
+	if got := operations.coalescedDatagramDrops.Load(); got != 1 {
+		t.Fatalf("coalesced datagram drops = %d", got)
 	}
 	if got := operations.staleUpdatesDropped.Load(); got != 1 {
 		t.Fatalf("stale datagram drops = %d", got)
 	}
 	stats := operations.stats()
-	if stats.LocalDatagramsDropped != 2 || stats.StaleUpdatesDropped != 1 || stats.BytesSent != 7 || stats.BytesReceived != 11 {
+	if stats.LocalDatagramsDropped != 3 || stats.CoalescedDatagramsDropped != 1 || stats.StaleUpdatesDropped != 1 || stats.BytesSent != 7 || stats.BytesReceived != 11 {
 		t.Fatalf("session stats = %#v", stats)
 	}
-	got := make(map[string]Observation, 2)
+	got := make(map[string]Observation, 3)
 	deadline := time.NewTimer(time.Second)
 	defer deadline.Stop()
-	for len(got) < 2 {
+	for len(got) < 3 {
 		select {
 		case value := <-observer.values:
 			got[value.Kind] = value
@@ -168,6 +172,9 @@ func TestDatagramDropAccounting(t *testing.T) {
 	}
 	if value := got["pressure"]; value.Name != "datagram_drop" || value.Code != Backpressure || value.Value != 1 {
 		t.Fatalf("pressure observation = %#v", value)
+	}
+	if value := got["coalesced"]; value.Name != "datagram_drop" || value.Code != Normal || value.Value != 1 {
+		t.Fatalf("coalesced observation = %#v", value)
 	}
 	if value := got["stale"]; value.Name != "datagram_drop" || value.Code != Normal || value.Value != 1 {
 		t.Fatalf("stale observation = %#v", value)

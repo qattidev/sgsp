@@ -5,16 +5,28 @@ matrix using separately built binaries. It writes one JSON result per trial,
 an `environment.txt` manifest, and a generated `summary.md` index.
 
 Each trial also records fixed-memory binary-histogram timing summaries. They
-include the local input-send API-call duration, successful request round trip,
-and same-process input-to-update delivery age. Percentiles are reported as
-explicit upper bounds, not exact samples; the histogram never retains one
-entry per operation. Input/send timing and update age are distinct measures,
-so transport transit is not misrepresented as local API overhead.
+include input and update API-to-adapter handoff durations, plus decoded-frame
+to continuous-poll/handler-return overhead at each receiving endpoint. The
+report correlates client index and input sequence to publish two true
+per-direction distributions: client input send plus server input receive, and
+server update send plus client update receive. Each carries its own
+unmatched-send fraction. Percentiles are explicit upper bounds, not exact
+samples; a timestamp-buffer overflow in either direction marks the trial
+invalid rather than silently dropping samples. Update age is a separate
+end-to-end application measure, so transport transit is not misrepresented as
+local API overhead.
 
-The JSON and report also retain relay forwarding/backlog state plus interval
-CPU time, live heap/RSS, allocation, and goroutine data. On Linux CPU time is
-user plus system process time; on other platforms a zero value means that this
-dependency-free collector is unavailable.
+The JSON and report also retain transport RTT, local/coalesced/stale SGSP
+datagram drops, explicit unknown request outcomes, queue occupancy maxima and
+bounded queue-age buckets, relay forwarding, and final and peak scheduled
+backlog state, plus interval CPU time, live heap/RSS, allocation, and
+goroutine data. Relay drops are observed network loss; they are not reported
+as local SGSP drops. The bare-QUIC baseline marks SGSP-only local-drop and
+dispatch-queue fields unavailable rather than reporting a fabricated zero;
+its request failures are still classified as known pre-send or unknown
+post-write outcomes. On Linux CPU time is user plus system process time; on
+other platforms a zero value means that this dependency-free collector is
+unavailable.
 
 Run the separate codec microbenchmark independently of transport trials:
 
@@ -43,6 +55,33 @@ impairment matrix:
 SGSPBENCH_GOMAXPROCS=4 SGSPBENCH_IMPAIRED_CLIENTS=16 \
   scripts/run-benchmark-matrix.sh artifacts/$(date -u +%Y%m%dT%H%M%SZ)
 ```
+
+The matrix runner rejects `/tmp` and other destinations outside this
+checkout's `artifacts/` directory. Keep the resulting directory as the local
+machine-readable record for the run; it contains the environment manifest,
+exact binaries, JSON trials, and rendered summary.
+
+For an interrupted campaign, rerun the identical command with
+`SGSPBENCH_RESUME=1`. The runner creates `campaign.json` on the first
+invocation and refuses to resume if its benchmark settings, Go version, or
+source snapshot differs. It retains the original manifest and writes a
+separate environment manifest for the resumed invocation.
+
+The reconnect cases are a separate real-QUIC regression test, rather than
+synthetic benchmark samples. It blackholes both directions of an established
+UDP relay for 2, 8, and 40 seconds, verifies continuity, resume within grace,
+and expiry beyond transport idle detection plus grace, and logs the observed
+recovery or expiry timing. Preserve its JSON output locally as well:
+
+```sh
+run_dir=artifacts/reconnect-$(date -u +%Y%m%dT%H%M%SZ)
+mkdir -p "$run_dir"
+go test -json -count=1 -run '^TestReconnectBlackholeDurations$' . \
+  > "$run_dir/test.json"
+```
+
+This is functional reconnect evidence, not a substitute for the five-seed
+capacity matrix.
 
 The generated report is a trial index, not a gate verdict. Its results must be
 evaluated against the p99 local-overhead, drop, plateau, reconnect, and

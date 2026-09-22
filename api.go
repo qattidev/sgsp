@@ -110,6 +110,7 @@ type Incoming struct {
 
 	ctx        context.Context
 	enqueuedAt time.Time
+	decodedAt  time.Time
 	release    func()
 	after      func()
 	reply      func(context.Context, []byte) error
@@ -124,6 +125,19 @@ func (i *Incoming) Context() context.Context {
 		return i.ctx
 	}
 	return context.Background()
+}
+
+// DecodedAt reports the local monotonic timestamp captured after SGSP has
+// completely decoded an incoming frame and before it enters dispatch. It is
+// zero for envelopes constructed without a transport frame, such as lifecycle
+// notifications. Applications normally do not need it; it permits benchmark
+// and profiling code to measure queue/dispatch latency without inferring a
+// one-way transport delay from wall clocks.
+func (i *Incoming) DecodedAt() time.Time {
+	if i == nil {
+		return time.Time{}
+	}
+	return i.decodedAt
 }
 func (i *Incoming) Reply(ctx context.Context, payload []byte) error {
 	if i == nil || i.Kind != RequestMessage || i.reply == nil {
@@ -282,6 +296,10 @@ type ServerConfig struct {
 	Dispatch         DispatchConfig
 	Limits           Limits
 	Observer         Observer
+	// clock is an internal deterministic-test seam. Public callers always use
+	// the system clock; keeping it unexported prevents a production clock from
+	// becoming part of the API contract.
+	clock endpointClock
 }
 type ClientConfig struct {
 	Role                      Role

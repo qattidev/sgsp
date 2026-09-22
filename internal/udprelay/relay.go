@@ -33,9 +33,9 @@ type Config struct {
 }
 
 type Stats struct {
-	Forwarded, Dropped, PendingPackets uint64
-	PendingBytes                       int64
-	Overloaded                         bool
+	Forwarded, Dropped, PendingPackets, PeakPendingPackets uint64
+	PendingBytes, PeakPendingBytes                         int64
+	Overloaded                                             bool
 }
 
 // Relay accepts one client path at ClientAddr and forwards it to upstream.
@@ -54,6 +54,8 @@ type Relay struct {
 	clientAddr       net.Addr
 	pendingPackets   int
 	pendingBytes     int64
+	peakPackets      int
+	peakBytes        int64
 	forwarded        uint64
 	dropped          uint64
 	overloaded       bool
@@ -163,7 +165,7 @@ func (r *Relay) Stats() Stats {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return Stats{Forwarded: r.forwarded, Dropped: r.dropped, PendingPackets: uint64(r.pendingPackets), PendingBytes: r.pendingBytes, Overloaded: r.overloaded}
+	return Stats{Forwarded: r.forwarded, Dropped: r.dropped, PendingPackets: uint64(r.pendingPackets), PendingBytes: r.pendingBytes, PeakPendingPackets: uint64(r.peakPackets), PeakPendingBytes: r.peakBytes, Overloaded: r.overloaded}
 }
 func (r *Relay) Err() error {
 	if r == nil {
@@ -239,6 +241,12 @@ func (r *Relay) enqueue(direction Direction, payload []byte, target net.Addr) {
 	}
 	r.pendingPackets++
 	r.pendingBytes += int64(len(payload))
+	if r.pendingPackets > r.peakPackets {
+		r.peakPackets = r.pendingPackets
+	}
+	if r.pendingBytes > r.peakBytes {
+		r.peakBytes = r.pendingBytes
+	}
 	r.mu.Unlock()
 	packet := relayPacket{direction: direction, payload: payload, target: target}
 	select {

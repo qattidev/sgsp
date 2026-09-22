@@ -46,8 +46,8 @@ func main() {
 	flag.StringVar(&cfg.Implementation, "implementation", "", "sgsp or quic")
 	flag.IntVar(&cfg.Clients, "clients", 0, "client count")
 	flag.IntVar(&cfg.Hz, "hz", 0, "60 or 128")
-	flag.IntVar(&cfg.InputBytes, "input-bytes", 64, "input payload bytes")
-	flag.IntVar(&cfg.UpdateBytes, "update-bytes", 512, "update payload bytes")
+	flag.IntVar(&cfg.InputBytes, "input-bytes", 64, "input payload bytes (at least 32 for benchmark metadata)")
+	flag.IntVar(&cfg.UpdateBytes, "update-bytes", 512, "update payload bytes (at least 32 for benchmark metadata)")
 	flag.IntVar(&cfg.RPCPerSecond, "rpc-per-second", 2, "request/reply rate per client")
 	flag.IntVar(&cfg.BulkBytes, "bulk-bytes-per-second", 64<<10, "reliable bulk bytes per client per second")
 	flag.DurationVar(&cfg.Warmup, "warmup", 10*time.Second, "warmup duration")
@@ -71,6 +71,18 @@ func main() {
 		fmt.Fprintln(os.Stderr, "sgspbench:", err)
 		os.Exit(1)
 	}
+	if measurement.Validity.InputSampleBufferOverflow || measurement.Validity.UpdateSampleBufferOverflow {
+		value.Status = "invalid"
+		value.Error = "correlated directional local-overhead sample buffer overflow"
+		writeResult(output, value)
+		return
+	}
+	if measurement.Generator.Unable {
+		value.Status = "invalid"
+		value.Error = "workload generator missed scheduled ticks"
+		writeResult(output, value)
+		return
+	}
 	value.Status = "completed"
 	writeResult(output, value)
 }
@@ -79,9 +91,9 @@ func validate(cfg config, output string) error {
 		return errors.New("--implementation must be sgsp or quic")
 	}
 	if cfg.Clients < 1 || (cfg.Hz != 60 && cfg.Hz != 128) ||
-		cfg.InputBytes < 0 ||
+		cfg.InputBytes < 32 ||
 		cfg.InputBytes > 1000 ||
-		cfg.UpdateBytes < 0 ||
+		cfg.UpdateBytes < 32 ||
 		cfg.UpdateBytes > 1000 ||
 		cfg.RPCPerSecond < 0 ||
 		cfg.BulkBytes < 0 ||

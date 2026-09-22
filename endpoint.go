@@ -35,7 +35,7 @@ type serverEndpoint struct {
 	sessions          map[SessionID]*sessionRecord
 	terminals         map[SessionID]terminalSession
 	terminalTTL       time.Duration
-	terminalTimer     *time.Timer
+	terminalTimer     endpointTimer
 	pending           int
 	groupMu           sync.Mutex
 	groups            map[string]*groupState
@@ -51,13 +51,32 @@ type serverEndpoint struct {
 	scheduler         *handlerScheduler
 	workers           sync.WaitGroup
 	started           chan struct{}
+	clock             endpointClock
 }
 type groupState struct {
 	closed    bool
 	persisted bool
-	timer     *time.Timer
+	timer     endpointTimer
 	sessions  map[*sessionRecord]struct{}
 }
+
+// endpointTimer and endpointClock let deterministic tests advance lifecycle
+// timers without sleeping. They are deliberately private: production uses the
+// system implementation selected by NewServer.
+type endpointTimer interface{ Stop() bool }
+
+type endpointClock interface {
+	Now() time.Time
+	AfterFunc(time.Duration, func()) endpointTimer
+}
+
+type systemEndpointClock struct{}
+
+func (systemEndpointClock) Now() time.Time { return time.Now() }
+func (systemEndpointClock) AfterFunc(delay time.Duration, callback func()) endpointTimer {
+	return time.AfterFunc(delay, callback)
+}
+
 type terminalSession struct {
 	code    Code
 	expires time.Time
@@ -102,11 +121,29 @@ func NewServer(config ServerConfig) (Server, error) {
 	}
 	config.Limits, config.Owner = limits, owner
 	config.Dispatch.Router = config.Dispatch.Router.snapshot()
-	server := &serverEndpoint{config: config, owner: owner, limits: limits, sessions: make(map[SessionID]*sessionRecord), terminals: make(map[SessionID]terminalSession), terminalTTL: 30 * time.Second, groups: make(map[string]*groupState), limiter: newHandshakeLimiter(limits.HandshakesPerIPPerSecond, limits.HandshakeBurstPerIP, nil), groupTTL: 35 * time.Second, observer: newObserverQueue(config.Observer, 4096, time.Second), applicationBudget: runtime.NewBudget(limits.GlobalApplicationBytes), changed: make(chan struct{}, 1), started: make(chan struct{})}
+	clock := config.clock
+	if clock == nil {
+		clock = systemEndpointClock{}
+	}
+	server := &serverEndpoint{config: config, owner: owner, limits: limits, sessions: make(map[SessionID]*sessionRecord), terminals: make(map[SessionID]terminalSession), terminalTTL: 30 * time.Second, groups: make(map[string]*groupState), limiter: newHandshakeLimiter(limits.HandshakesPerIPPerSecond, limits.HandshakeBurstPerIP, nil), groupTTL: 35 * time.Second, observer: newObserverQueue(config.Observer, 4096, time.Second), applicationBudget: runtime.NewBudget(limits.GlobalApplicationBytes), changed: make(chan struct{}, 1), started: make(chan struct{}), clock: clock}
 	if config.Dispatch.Mode == Polling {
 		server.incoming = newIncomingQueue(limits.GlobalApplicationBytes, limits.QueueMessages*limits.MaxSessions, server.applicationBudget)
 	}
 	return server, nil
+}
+
+func (s *serverEndpoint) now() time.Time {
+	if s == nil || s.clock == nil {
+		return time.Now()
+	}
+	return s.clock.Now()
+}
+
+func (s *serverEndpoint) afterFunc(delay time.Duration, callback func()) endpointTimer {
+	if s == nil || s.clock == nil {
+		return time.AfterFunc(delay, callback)
+	}
+	return s.clock.AfterFunc(delay, callback)
 }
 
 func (s *serverEndpoint) Owner() Owner { return s.owner }
@@ -117,7 +154,7 @@ func (s *serverEndpoint) observe(name, kind string, code Code, value float64) {
 }
 
 func (s *serverEndpoint) armExpiry(session *sessionRecord, expiresAt time.Time) {
-	delay := time.Until(expiresAt)
+	delay := expiresAt.Sub(s.now())
 	if delay < 0 {
 		delay = 0
 	}
@@ -125,7 +162,7 @@ func (s *serverEndpoint) armExpiry(session *sessionRecord, expiresAt time.Time) 
 	if session.expiryTimer != nil {
 		session.expiryTimer.Stop()
 	}
-	session.expiryTimer = time.AfterFunc(delay, func() { s.closeSession(session, AuthExpired) })
+	session.expiryTimer = s.afterFunc(delay, func() { s.closeSession(session, AuthExpired) })
 	session.mu.Unlock()
 }
 func (s *serverEndpoint) armGrace(session *sessionRecord) {
@@ -135,8 +172,10 @@ func (s *serverEndpoint) armGrace(session *sessionRecord) {
 		return
 	}
 	delay := s.limits.ResumeGrace
-	if untilExpiry := time.Until(session.principal.ExpiresAt); untilExpiry < delay {
+	code := SessionExpired
+	if untilExpiry := session.principal.ExpiresAt.Sub(s.now()); untilExpiry <= delay {
 		delay = untilExpiry
+		code = AuthExpired
 	}
 	if delay < 0 {
 		delay = 0
@@ -144,7 +183,7 @@ func (s *serverEndpoint) armGrace(session *sessionRecord) {
 	if session.graceTimer != nil {
 		session.graceTimer.Stop()
 	}
-	session.graceTimer = time.AfterFunc(delay, func() { s.closeSession(session, SessionExpired) })
+	session.graceTimer = s.afterFunc(delay, func() { s.closeSession(session, code) })
 	session.mu.Unlock()
 }
 func (s *serverEndpoint) closeSession(session *sessionRecord, code Code) {
@@ -195,7 +234,7 @@ func (s *serverEndpoint) recordTerminalLocked(id SessionID, code Code) {
 	if s.terminals == nil {
 		s.terminals = make(map[SessionID]terminalSession)
 	}
-	now := time.Now()
+	now := s.now()
 	s.expireTerminalsLocked(now)
 	if _, exists := s.terminals[id]; !exists && len(s.terminals) >= s.terminalCacheCapacity() {
 		var oldest SessionID
@@ -236,20 +275,20 @@ func (s *serverEndpoint) scheduleTerminalExpiryLocked() {
 	if next.IsZero() {
 		return
 	}
-	delay := time.Until(next)
+	delay := next.Sub(s.now())
 	if delay < 0 {
 		delay = 0
 	}
-	s.terminalTimer = time.AfterFunc(delay, func() {
+	s.terminalTimer = s.afterFunc(delay, func() {
 		s.mu.Lock()
-		s.expireTerminalsLocked(time.Now())
+		s.expireTerminalsLocked(s.now())
 		s.mu.Unlock()
 	})
 }
 func (s *serverEndpoint) lookupSession(id SessionID) (*sessionRecord, Code) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.expireTerminalsLocked(time.Now())
+	s.expireTerminalsLocked(s.now())
 	if session := s.sessions[id]; session != nil {
 		return session, Normal
 	}
@@ -295,7 +334,7 @@ func (s *serverEndpoint) retainClosedGroup(groupKey string, group *groupState) {
 	if ttl <= 0 {
 		ttl = 35 * time.Second
 	}
-	group.timer = time.AfterFunc(ttl, func() {
+	group.timer = s.afterFunc(ttl, func() {
 		s.groupMu.Lock()
 		defer s.groupMu.Unlock()
 		if s.groups[groupKey] == group && group.closed && group.persisted {
@@ -464,11 +503,11 @@ func (s *serverEndpoint) handleConnection(connection transport.Conn) {
 	authStarted := time.Now()
 	principal, err := s.config.Auth.Authenticate(ctx, Credential{Scheme: hello.Credential.Scheme, Data: credentialData})
 	authCode := Normal
-	if err != nil || principal.Issuer == "" || principal.Subject == "" || !principal.ExpiresAt.After(time.Now()) {
+	if err != nil || principal.Issuer == "" || principal.Subject == "" || !principal.ExpiresAt.After(s.now()) {
 		authCode = Unauthenticated
 	}
 	s.observe("auth", histogramKind("verify", time.Since(authStarted)), authCode, 1)
-	if err != nil || principal.Issuer == "" || principal.Subject == "" || !principal.ExpiresAt.After(time.Now()) {
+	if err != nil || principal.Issuer == "" || principal.Subject == "" || !principal.ExpiresAt.After(s.now()) {
 		rejectHandshake(Unauthenticated, "authentication failed")
 		return
 	}
@@ -619,7 +658,7 @@ func (s *serverEndpoint) resumeConnection(connection transport.Conn, channel *co
 	}
 	session.mu.Lock()
 	current := session.principal
-	if session.state == Closed || !current.ExpiresAt.After(time.Now()) || current.Issuer != principal.Issuer || current.Subject != principal.Subject || session.peerLimits != hello.Limits || subtle.ConstantTimeCompare(session.resumeHash[:], hash[:]) != 1 {
+	if session.state == Closed || !current.ExpiresAt.After(s.now()) || current.Issuer != principal.Issuer || current.Subject != principal.Subject || session.peerLimits != hello.Limits || subtle.ConstantTimeCompare(session.resumeHash[:], hash[:]) != 1 {
 		session.mu.Unlock()
 		if group != nil {
 			s.groupMu.Unlock()
@@ -687,7 +726,7 @@ func (s *serverEndpoint) authorizeAdmission(ctx context.Context, hello helloMess
 	if err != nil {
 		return err
 	}
-	if admission.App != s.config.App || admission.PrincipalIssuer != principal.Issuer || admission.Subject != principal.Subject || admission.Owner != s.owner || admission.GroupKey != hello.Group || !admission.ExpiresAt.After(time.Now()) {
+	if admission.App != s.config.App || admission.PrincipalIssuer != principal.Issuer || admission.Subject != principal.Subject || admission.Owner != s.owner || admission.GroupKey != hello.Group || !admission.ExpiresAt.After(s.now()) {
 		return ErrForbidden
 	}
 	return s.config.AuthorizeGroup(ctx, principal, hello.Group)
@@ -708,7 +747,7 @@ func (s *serverEndpoint) handleRefresh(ctx context.Context, session *sessionReco
 	refreshStarted := time.Now()
 	principal, err := s.config.Auth.Authenticate(refreshCtx, Credential{Scheme: message.Credential.Scheme, Data: data})
 	previous := session.Principal()
-	refreshOK := err == nil && principal.Issuer == previous.Issuer && principal.Subject == previous.Subject && principal.ExpiresAt.After(time.Now())
+	refreshOK := err == nil && principal.Issuer == previous.Issuer && principal.Subject == previous.Subject && principal.ExpiresAt.After(s.now())
 	refreshCode := Normal
 	if !refreshOK {
 		refreshCode = Unauthenticated
@@ -1263,47 +1302,46 @@ func (c *clientEndpoint) Close(ctx context.Context) error {
 }
 
 type connectionOperations struct {
-	connection                                     transport.Conn
-	control                                        *controlChannel
-	onRefresh                                      func(Principal)
-	onIncomingRefresh                              func(context.Context, wire.Control) refreshResultMessage
-	refreshMu                                      sync.Mutex
-	refreshStateMu                                 sync.Mutex
-	refreshActive                                  bool
-	refreshReply                                   chan refreshResultMessage
-	controlStart                                   sync.Once
-	closeMu                                        sync.Mutex
-	closeAck                                       chan struct{}
-	session                                        *sessionRecord
-	router                                         *Router
-	mode                                           DispatchMode
-	incoming                                       *incomingQueue
-	onLost                                         func(*connectionOperations)
-	onTerminal                                     func()
-	epoch                                          uint64
-	epochMu                                        sync.Mutex
-	epochCtx                                       context.Context
-	stop                                           context.CancelFunc
-	scheduler                                      *handlerScheduler
-	applicationBudget                              *runtime.Budget
-	observer                                       *observerQueue
-	handlerMu                                      sync.Mutex
-	handlerQueue                                   *runtime.Queue[*Incoming]
-	handlerScheduled                               bool
-	eventMu                                        sync.Mutex
-	sequences                                      map[ChannelID]uint64
-	received                                       map[ChannelID]uint64
-	channelMu                                      sync.Mutex
-	outbound                                       map[ChannelID]Delivery
-	inbound                                        map[ChannelID]Delivery
-	reliable                                       map[ChannelID]transport.SendStream
-	slotMu                                         sync.Mutex
-	inRequests, outRequests, inStreams, outStreams int
-	rateMu                                         sync.Mutex
-	rateTokens                                     float64
-	rateAt                                         time.Time
-	localDatagramDrops                             atomic.Uint64
-	staleUpdatesDropped                            atomic.Uint64
+	connection                                                      transport.Conn
+	control                                                         *controlChannel
+	onRefresh                                                       func(Principal)
+	onIncomingRefresh                                               func(context.Context, wire.Control) refreshResultMessage
+	refreshMu                                                       sync.Mutex
+	refreshStateMu                                                  sync.Mutex
+	refreshActive                                                   bool
+	refreshReply                                                    chan refreshResultMessage
+	controlStart                                                    sync.Once
+	closeMu                                                         sync.Mutex
+	closeAck                                                        chan struct{}
+	session                                                         *sessionRecord
+	router                                                          *Router
+	mode                                                            DispatchMode
+	incoming                                                        *incomingQueue
+	onLost                                                          func(*connectionOperations)
+	onTerminal                                                      func()
+	epoch                                                           uint64
+	epochMu                                                         sync.Mutex
+	epochCtx                                                        context.Context
+	stop                                                            context.CancelFunc
+	scheduler                                                       *handlerScheduler
+	applicationBudget                                               *runtime.Budget
+	observer                                                        *observerQueue
+	handlerMu                                                       sync.Mutex
+	handlerQueue                                                    *runtime.Queue[*Incoming]
+	handlerScheduled                                                bool
+	eventMu                                                         sync.Mutex
+	sequences                                                       map[ChannelID]uint64
+	received                                                        map[ChannelID]uint64
+	channelMu                                                       sync.Mutex
+	outbound                                                        map[ChannelID]Delivery
+	inbound                                                         map[ChannelID]Delivery
+	reliable                                                        map[ChannelID]transport.SendStream
+	slotMu                                                          sync.Mutex
+	inRequests, outRequests, inStreams, outStreams                  int
+	rateMu                                                          sync.Mutex
+	rateTokens                                                      float64
+	rateAt                                                          time.Time
+	localDatagramDrops, coalescedDatagramDrops, staleUpdatesDropped atomic.Uint64
 }
 
 // incomingQueue owns polling-mode envelopes until the application releases
@@ -1738,6 +1776,9 @@ func (o *connectionOperations) dropDatagram(kind string, code Code, stale bool) 
 		return
 	}
 	o.localDatagramDrops.Add(1)
+	if kind == "coalesced" {
+		o.coalescedDatagramDrops.Add(1)
+	}
 	if stale {
 		o.staleUpdatesDropped.Add(1)
 	}
@@ -2042,7 +2083,7 @@ func (o *connectionOperations) reserveReliableIncoming(ctx context.Context, byte
 
 func (o *connectionOperations) deliverReservedReliableEvent(event wire.Event, reservation *reliableIncomingReservation) error {
 	o.observeMessage("in_reliable", len(event.Payload))
-	incoming := &Incoming{Kind: Event, Session: o.session, Epoch: o.epoch, Type: MessageType(event.MessageType), Channel: ChannelID(event.Channel), Delivery: ReliableOrdered, Payload: event.Payload, ctx: o.context()}
+	incoming := &Incoming{Kind: Event, Session: o.session, Epoch: o.epoch, Type: MessageType(event.MessageType), Channel: ChannelID(event.Channel), Delivery: ReliableOrdered, Payload: event.Payload, ctx: o.context(), decodedAt: time.Now()}
 	if o.mode == Polling {
 		if o.incoming == nil || !reservation.Commit(incoming) {
 			return ErrBackpressure
@@ -2813,7 +2854,7 @@ func (o *connectionOperations) stats() Stats {
 		return Stats{}
 	}
 	stats := o.connection.Stats()
-	return Stats{RTT: stats.RTT, TransportStatsAvailable: true, BytesSent: stats.BytesSent, BytesReceived: stats.BytesReceived, LocalDatagramsDropped: o.localDatagramDrops.Load(), StaleUpdatesDropped: o.staleUpdatesDropped.Load()}
+	return Stats{RTT: stats.RTT, TransportStatsAvailable: true, BytesSent: stats.BytesSent, BytesReceived: stats.BytesReceived, LocalDatagramsDropped: o.localDatagramDrops.Load(), CoalescedDatagramsDropped: o.coalescedDatagramDrops.Load(), StaleUpdatesDropped: o.staleUpdatesDropped.Load()}
 }
 func (o *connectionOperations) startReceive() {
 	if o.session == nil {
@@ -3458,7 +3499,7 @@ func (o *connectionOperations) deliverEvent(event wire.Event) {
 		kind = "in_sequenced"
 	}
 	o.observeMessage(kind, len(event.Payload))
-	incoming := &Incoming{Kind: Event, Session: o.session, Epoch: o.epoch, Type: MessageType(event.MessageType), Channel: ChannelID(event.Channel), Payload: append([]byte(nil), event.Payload...), ctx: o.context()}
+	incoming := &Incoming{Kind: Event, Session: o.session, Epoch: o.epoch, Type: MessageType(event.MessageType), Channel: ChannelID(event.Channel), Payload: append([]byte(nil), event.Payload...), ctx: o.context(), decodedAt: time.Now()}
 	switch event.Kind {
 	case wire.UnreliableKind:
 		incoming.Delivery = Unreliable

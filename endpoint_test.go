@@ -22,6 +22,7 @@ import (
 
 	"qattidev/sgsp/internal/quictransport"
 	"qattidev/sgsp/internal/runtime"
+	"qattidev/sgsp/internal/testutil"
 	"qattidev/sgsp/internal/transport"
 	"qattidev/sgsp/internal/udprelay"
 	"qattidev/sgsp/internal/wire"
@@ -31,6 +32,54 @@ type testAuthenticator struct {
 	calls          atomic.Int32
 	expires        time.Duration
 	refreshExpires time.Duration
+}
+
+// testEndpointClock adapts the deterministic M0 clock to the private server
+// clock seam. Stopped timers stop their waiter goroutine; the underlying
+// clock's buffered waiter is harmless when a test later advances it.
+type testEndpointClock struct{ clock *testutil.Clock }
+
+func (c testEndpointClock) Now() time.Time { return c.clock.Now() }
+func (c testEndpointClock) AfterFunc(delay time.Duration, callback func()) endpointTimer {
+	timer := &testEndpointTimer{done: make(chan struct{})}
+	after := c.clock.After(delay)
+	go func() {
+		select {
+		case <-after:
+			timer.fire(callback)
+		case <-timer.done:
+		}
+	}()
+	return timer
+}
+
+type testEndpointTimer struct {
+	mu      sync.Mutex
+	stopped bool
+	done    chan struct{}
+}
+
+func (t *testEndpointTimer) Stop() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.stopped {
+		return false
+	}
+	t.stopped = true
+	close(t.done)
+	return true
+}
+
+func (t *testEndpointTimer) fire(callback func()) {
+	t.mu.Lock()
+	if t.stopped {
+		t.mu.Unlock()
+		return
+	}
+	t.stopped = true
+	close(t.done)
+	t.mu.Unlock()
+	callback()
 }
 
 type principalAuthenticator struct{}
@@ -1359,6 +1408,150 @@ drainedForwarding:
 	}
 }
 
+// TestReconnectBlackholeDurations exercises the section-12 reconnect cases
+// through the real two-socket UDP relay. In particular, it does not simulate
+// loss by closing either endpoint's transport: both directions remain bound
+// while packets are discarded for the specified outage duration.
+func TestReconnectBlackholeDurations(t *testing.T) {
+	if testing.Short() {
+		t.Skip("takes about 50 seconds to cover the specified UDP-blackhole durations")
+	}
+	tests := []struct {
+		name       string
+		outage     time.Duration
+		wantEpoch  uint64
+		wantExpiry bool
+	}{
+		{name: "short_transport_recovery", outage: 2 * time.Second, wantEpoch: 1},
+		{name: "resume_within_grace", outage: 8 * time.Second, wantEpoch: 2},
+		{name: "expiry_after_idle_and_grace", outage: 40 * time.Second, wantExpiry: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			certificate, roots := endpointCertificate(t)
+			packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			serverRouter := NewRouter()
+			if err := serverRouter.OnEvent(61, func(ctx context.Context, incoming *Incoming) {
+				_ = incoming.Session.Send(ctx, 62, append([]byte(nil), incoming.Payload...), SendOptions{Channel: 2, Delivery: UnreliableSequenced})
+			}); err != nil {
+				t.Fatal(err)
+			}
+			limits := DefaultLimits()
+			server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{expires: 2 * time.Minute}, Limits: limits, Dispatch: DispatchConfig{Mode: Handlers, Router: serverRouter}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			endpoint := server.(*serverEndpoint)
+			serveCtx, stop := context.WithCancel(context.Background())
+			serveDone := make(chan error, 1)
+			go func() { serveDone <- server.Serve(serveCtx, packet) }()
+			<-endpoint.started
+			defer func() {
+				stop()
+				if err := <-serveDone; err != nil {
+					t.Error(err)
+				}
+			}()
+
+			upstream, err := net.ResolveUDPAddr("udp", packet.LocalAddr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			relay, err := udprelay.New("127.0.0.1:0", "127.0.0.1:0", upstream, udprelay.Config{Seed: 61})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := relay.Close(); err != nil {
+					t.Error(err)
+				}
+			}()
+
+			updates := make(chan string, 2)
+			clientRouter := NewRouter()
+			if err := clientRouter.OnEvent(62, func(_ context.Context, incoming *Incoming) {
+				select {
+				case updates <- string(incoming.Payload):
+				default:
+				}
+			}); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), test.outage+20*time.Second)
+			defer cancel()
+			client, err := Dial(ctx, Endpoint{Address: relay.ClientAddr().String(), ServerName: "localhost"}, ClientConfig{TLS: &tls.Config{RootCAs: roots}, App: AppIdentity{ID: "app", Version: "1"}, Limits: limits, Credentials: func(context.Context) (Credential, error) {
+				return Credential{Scheme: "test", Data: []byte("valid")}, nil
+			}, Dispatch: DispatchConfig{Mode: Handlers, Router: clientRouter}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = client.Close(context.Background()) }()
+			serverSession := endpoint.Sessions()[0].(*sessionRecord)
+			expiredAt := make(chan time.Time, 1)
+			if test.wantExpiry {
+				go func() {
+					<-client.Session().Context().Done()
+					expiredAt <- time.Now()
+				}()
+			}
+
+			outageStarted := time.Now()
+			relay.SetBlackhole(udprelay.ClientToServer, true)
+			relay.SetBlackhole(udprelay.ServerToClient, true)
+			timer := time.NewTimer(test.outage)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				t.Fatal(ctx.Err())
+			}
+			relay.SetBlackhole(udprelay.ClientToServer, false)
+			relay.SetBlackhole(udprelay.ServerToClient, false)
+			outageEnded := time.Now()
+
+			if test.wantExpiry {
+				var terminalAt time.Time
+				select {
+				case terminalAt = <-expiredAt:
+					if !terminalAt.Before(outageEnded) {
+						t.Fatalf("session expired after the UDP blackhole was lifted: expiry=%s outage=%s", terminalAt.Sub(outageStarted).Round(time.Millisecond), test.outage)
+					}
+				case <-ctx.Done():
+					t.Fatal("client remained reconnecting beyond idle detection and resume grace")
+				}
+				if code := client.(*clientEndpoint).session.terminalCode(); code != SessionExpired {
+					t.Fatalf("client terminal reconnect code = %v, want %v", code, SessionExpired)
+				}
+				if _, code := endpoint.lookupSession(serverSession.ID()); code != SessionExpired {
+					t.Fatalf("server terminal reconnect code = %v, want %v", code, SessionExpired)
+				}
+				t.Logf("UDP blackhole=%s; session expiry=%s", test.outage, terminalAt.Sub(outageStarted).Round(time.Millisecond))
+				return
+			}
+
+			waitForSessionState(t, ctx, client.Session(), Active, test.wantEpoch)
+			waitForSessionState(t, ctx, serverSession, Active, test.wantEpoch)
+			recovery := time.Since(outageEnded)
+			payload := test.name
+			if err := client.Session().Send(ctx, 61, []byte(payload), SendOptions{Channel: 1, Delivery: UnreliableSequenced}); err != nil {
+				t.Fatalf("post-blackhole send = %v", err)
+			}
+			select {
+			case update := <-updates:
+				if update != payload {
+					t.Fatalf("post-blackhole echo = %q, want %q", update, payload)
+				}
+			case <-ctx.Done():
+				t.Fatalf("post-blackhole echo: %v", ctx.Err())
+			}
+			t.Logf("UDP blackhole=%s; epoch=%d; recovery=%s", test.outage, client.Session().Epoch(), recovery.Round(time.Millisecond))
+		})
+	}
+}
+
 func TestOwnerRestart(t *testing.T) {
 	certificate, roots := endpointCertificate(t)
 	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -1735,7 +1928,8 @@ func TestResumeGrace(t *testing.T) {
 	}
 	limits := DefaultLimits()
 	limits.ResumeGrace = 75 * time.Millisecond
-	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Limits: limits, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}})
+	clock := testEndpointClock{clock: testutil.NewClock(time.Now())}
+	server, err := NewServer(ServerConfig{TLS: &tls.Config{Certificates: []tls.Certificate{certificate}}, App: AppIdentity{ID: "app", Version: "1"}, Owner: Owner{ID: "server", Endpoint: Endpoint{Address: packet.LocalAddr().String(), ServerName: "localhost"}}, Auth: &testAuthenticator{}, Limits: limits, Dispatch: DispatchConfig{Mode: Handlers, Router: NewRouter()}, clock: clock})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1762,6 +1956,11 @@ func TestResumeGrace(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForSessionState(t, ctx, serverSession, Suspended, 1)
+	waitForGraceTimer(t, ctx, serverSession)
+	clock.clock.Advance(limits.ResumeGrace - time.Nanosecond)
+	if serverSession.State() != Suspended {
+		t.Fatalf("session state before grace = %v, want %v", serverSession.State(), Suspended)
+	}
 	attachment, err := concrete.openResume(ctx)
 	if err != nil {
 		t.Fatalf("resume before grace = %v", err)
@@ -1774,23 +1973,58 @@ func TestResumeGrace(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForSessionState(t, ctx, serverSession, Suspended, 2)
-	deadline := time.NewTimer(time.Second)
-	defer deadline.Stop()
-	for {
-		_, code := endpoint.lookupSession(serverSession.ID())
-		if code == SessionExpired {
-			break
-		}
-		select {
-		case <-time.After(time.Millisecond):
-		case <-deadline.C:
-			t.Fatal("suspended session remained resumable after grace")
-		}
+	waitForGraceTimer(t, ctx, serverSession)
+	clock.clock.Advance(limits.ResumeGrace)
+	waitForSessionState(t, ctx, serverSession, Closed, 2)
+	if _, code := endpoint.lookupSession(serverSession.ID()); code != SessionExpired {
+		t.Fatalf("terminal code after grace = %v, want %v", code, SessionExpired)
 	}
 	_ = client.Close(context.Background())
 	stop()
 	if err := <-serveDone; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestResumeGraceHonorsEarlierAuthenticationExpiry(t *testing.T) {
+	limits := DefaultLimits()
+	limits.ResumeGrace = time.Minute
+	clock := testEndpointClock{clock: testutil.NewClock(time.Now())}
+	session := newSessionRecord(SessionID{1}, Owner{}, "", Principal{Issuer: "test", Subject: "player", ExpiresAt: clock.Now().Add(30 * time.Second)}, limits, false, nil)
+	server := &serverEndpoint{limits: limits, sessions: map[SessionID]*sessionRecord{session.ID(): session}, terminals: make(map[SessionID]terminalSession), terminalTTL: 30 * time.Second, clock: clock}
+
+	server.armExpiry(session, session.Principal().ExpiresAt)
+	session.mu.Lock()
+	session.state = Suspended
+	session.mu.Unlock()
+	server.armGrace(session)
+	clock.clock.Advance(30*time.Second - time.Nanosecond)
+	if state := session.State(); state != Suspended {
+		t.Fatalf("session state before authentication expiry = %v, want %v", state, Suspended)
+	}
+	clock.clock.Advance(time.Nanosecond)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	waitForSessionState(t, ctx, session, Closed, 1)
+	if code := session.terminalCode(); code != AuthExpired {
+		t.Fatalf("terminal code at earlier authentication expiry = %v, want %v", code, AuthExpired)
+	}
+}
+
+func waitForGraceTimer(t *testing.T, ctx context.Context, session *sessionRecord) {
+	t.Helper()
+	for {
+		session.mu.RLock()
+		armed := session.graceTimer != nil
+		session.mu.RUnlock()
+		if armed {
+			return
+		}
+		select {
+		case <-time.After(time.Millisecond):
+		case <-ctx.Done():
+			t.Fatalf("resume grace timer was not armed: %v", ctx.Err())
+		}
 	}
 }
 
