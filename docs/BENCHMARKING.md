@@ -24,8 +24,15 @@ goroutine data. Relay drops are observed network loss; they are not reported
 as local SGSP drops. The bare-QUIC baseline marks SGSP-only local-drop and
 dispatch-queue fields unavailable rather than reporting a fabricated zero;
 its request failures are still classified as known pre-send or unknown
-post-write outcomes. On Linux CPU time is user plus system process time; on
-other platforms a zero value means that this dependency-free collector is
+post-write outcomes. Warmup and measured generators are separate phases:
+measurement inputs and requests carry a phase marker and measured bulk uses a
+separate stream type, so late warmup traffic cannot increase measured offered,
+accepted, or delivered counts. Measured bulk streams are prepared before the
+timer starts and released together with the other generators. The result also
+records scheduled and missed input, request, and bulk ticks. A missed tick
+marks the trial invalid rather than hiding generator shortfall behind a lower
+offered rate. On Linux CPU time is user plus system process time; on other
+platforms a zero value means that this dependency-free collector is
 unavailable.
 
 Run the separate codec microbenchmark independently of transport trials:

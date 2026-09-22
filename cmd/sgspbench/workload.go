@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
@@ -871,7 +872,7 @@ func runSGSPTrial(parent context.Context, cfg config) (result measurement, resul
 	trialCtx, cancelTrial := context.WithTimeout(parent, cfg.Warmup+cfg.Duration+10*time.Second)
 	defer cancelTrial()
 
-	startWorkers := func(measured bool) (context.CancelFunc, *sync.WaitGroup) {
+	startWorkers := func(measured bool, start <-chan struct{}, ready chan<- error) (context.CancelFunc, *sync.WaitGroup) {
 		workCtx, stopWork := context.WithCancel(trialCtx)
 		workers := &sync.WaitGroup{}
 		for index, client := range clients {
@@ -882,12 +883,12 @@ func runSGSPTrial(parent context.Context, cfg config) (result measurement, resul
 			}(client.client, updateCorrelators[index])
 			go func(session sgsp.Session, clientIndex int, correlator *localOverheadCorrelator) {
 				defer workers.Done()
-				runSGSPClient(workCtx, cfg, session, counters, clock, clientIndex, correlator, measured)
+				runSGSPClient(workCtx, cfg, session, counters, clock, clientIndex, correlator, measured, start, ready)
 			}(client.client.Session(), index, inputCorrelators[index])
 		}
 		return stopWork, workers
 	}
-	warmupStop, warmupWorkers := startWorkers(false)
+	warmupStop, warmupWorkers := startWorkers(false, nil, nil)
 	if !waitTrial(trialCtx, cfg.Warmup) {
 		warmupStop()
 		warmupWorkers.Wait()
@@ -906,10 +907,22 @@ func runSGSPTrial(parent context.Context, cfg config) (result measurement, resul
 	for _, correlator := range updateCorrelators {
 		correlator.Reset()
 	}
-	counters.startMeasurement()
+	measurementStart := make(chan struct{})
+	measurementReady := make(chan error, cfg.Clients)
+	measurementStop, measurementWorkers := startWorkers(true, measurementStart, measurementReady)
+	if err := waitForWorkloadSetup(trialCtx, measurementReady, cfg.Clients); err != nil {
+		measurementStop()
+		measurementWorkers.Wait()
+		return result, err
+	}
+	// The preparation opens measurement-phase streams but does not emit
+	// workload. Reset queue observations once that setup has drained, then
+	// release every generator from the same measurement boundary.
+	observer.Reset()
 	started := time.Now()
 	runtimeStarted := runtimeSnapshot()
-	measurementStop, measurementWorkers := startWorkers(true)
+	counters.startMeasurement()
+	close(measurementStart)
 	if !waitTrial(trialCtx, cfg.Duration) {
 		counters.stopMeasurement()
 		measurementStop()
@@ -1064,7 +1077,7 @@ func runQUICTrial(parent context.Context, cfg config) (result measurement, resul
 	trialCtx, cancelTrial := context.WithTimeout(parent, cfg.Warmup+cfg.Duration+10*time.Second)
 	defer cancelTrial()
 
-	startWorkers := func(measured bool) (context.CancelFunc, *sync.WaitGroup) {
+	startWorkers := func(measured bool, start <-chan struct{}, ready chan<- error) (context.CancelFunc, *sync.WaitGroup) {
 		workCtx, stopWork := context.WithCancel(trialCtx)
 		workers := &sync.WaitGroup{}
 		for index, client := range clients {
@@ -1075,12 +1088,12 @@ func runQUICTrial(parent context.Context, cfg config) (result measurement, resul
 			}(client.connection, updateCorrelators[index])
 			go func(connection transport.Conn, clientIndex int, correlator *localOverheadCorrelator) {
 				defer workers.Done()
-				runBareQUICClient(workCtx, cfg, connection, counters, clock, clientIndex, correlator, measured)
+				runBareQUICClient(workCtx, cfg, connection, counters, clock, clientIndex, correlator, measured, start, ready)
 			}(client.connection, index, inputCorrelators[index])
 		}
 		return stopWork, workers
 	}
-	warmupStop, warmupWorkers := startWorkers(false)
+	warmupStop, warmupWorkers := startWorkers(false, nil, nil)
 	if !waitTrial(trialCtx, cfg.Warmup) {
 		warmupStop()
 		warmupWorkers.Wait()
@@ -1095,10 +1108,18 @@ func runQUICTrial(parent context.Context, cfg config) (result measurement, resul
 	for _, correlator := range updateCorrelators {
 		correlator.Reset()
 	}
-	counters.startMeasurement()
+	measurementStart := make(chan struct{})
+	measurementReady := make(chan error, cfg.Clients)
+	measurementStop, measurementWorkers := startWorkers(true, measurementStart, measurementReady)
+	if err := waitForWorkloadSetup(trialCtx, measurementReady, cfg.Clients); err != nil {
+		measurementStop()
+		measurementWorkers.Wait()
+		return result, err
+	}
 	started := time.Now()
 	runtimeStarted := runtimeSnapshot()
-	measurementStop, measurementWorkers := startWorkers(true)
+	counters.startMeasurement()
+	close(measurementStart)
 	if !waitTrial(trialCtx, cfg.Duration) {
 		counters.stopMeasurement()
 		measurementStop()
@@ -1289,7 +1310,42 @@ func receiveBareUpdates(ctx context.Context, connection transport.Conn, cfg conf
 	}
 }
 
-func runBareQUICClient(ctx context.Context, cfg config, connection transport.Conn, counters *trialCounters, clock benchmarkClock, clientIndex int, correlator *localOverheadCorrelator, measured bool) {
+func runBareQUICClient(ctx context.Context, cfg config, connection transport.Conn, counters *trialCounters, clock benchmarkClock, clientIndex int, correlator *localOverheadCorrelator, measured bool, start <-chan struct{}, ready chan<- error) {
+	var stream transport.BidiStream
+	var stopStream func()
+	var setupErr error
+	if cfg.BulkBytes > 0 {
+		opened, err := openBareBulkStream(ctx, connection, measured)
+		if err != nil {
+			setupErr = err
+		} else {
+			stream, stopStream = opened, abortBidiOnContext(ctx, opened)
+		}
+	}
+	defer func() {
+		if stream != nil {
+			stopStream()
+			stream.Abort(uint64(sgsp.Canceled))
+			_ = stream.Close()
+		}
+	}()
+	if ready != nil {
+		select {
+		case ready <- setupErr:
+		case <-ctx.Done():
+			return
+		}
+	}
+	if setupErr != nil && measured {
+		return
+	}
+	if start != nil {
+		select {
+		case <-start:
+		case <-ctx.Done():
+			return
+		}
+	}
 	inputTicker := time.NewTicker(time.Second / time.Duration(cfg.Hz))
 	defer inputTicker.Stop()
 	inputSchedule := scheduledTicker{interval: time.Second / time.Duration(cfg.Hz)}
@@ -1303,29 +1359,12 @@ func runBareQUICClient(ctx context.Context, cfg config, connection transport.Con
 	rpcSchedule := scheduledTicker{interval: time.Second / time.Duration(max(cfg.RPCPerSecond, 1))}
 	var bulkTicker *time.Ticker
 	var bulk <-chan time.Time
-	var stream transport.BidiStream
-	var stopStream func()
-	if cfg.BulkBytes > 0 {
-		opened, err := openBareBulkStream(ctx, connection, measured)
-		if err != nil {
-			if counters.recording() {
-				counters.bulkFailed.Add(1)
-			}
-		} else {
-			stream, stopStream = opened, abortBidiOnContext(ctx, opened)
-			bulkTicker = time.NewTicker(10 * time.Millisecond)
-			defer bulkTicker.Stop()
-			bulk = bulkTicker.C
-		}
+	if stream != nil {
+		bulkTicker = time.NewTicker(10 * time.Millisecond)
+		defer bulkTicker.Stop()
+		bulk = bulkTicker.C
 	}
 	bulkSchedule := scheduledTicker{interval: 10 * time.Millisecond}
-	defer func() {
-		if stream != nil {
-			stopStream()
-			stream.Abort(uint64(sgsp.Canceled))
-			_ = stream.Close()
-		}
-	}()
 	var tick, sequence uint64
 	pacer := bulkPacer{perSecond: cfg.BulkBytes}
 	for {
@@ -1599,22 +1638,10 @@ func receiveSGSPUpdates(ctx context.Context, client sgsp.Client, counters *trial
 	}
 }
 
-func runSGSPClient(ctx context.Context, cfg config, session sgsp.Session, counters *trialCounters, clock benchmarkClock, clientIndex int, correlator *localOverheadCorrelator, measured bool) {
-	inputTicker := time.NewTicker(time.Second / time.Duration(cfg.Hz))
-	defer inputTicker.Stop()
-	inputSchedule := scheduledTicker{interval: time.Second / time.Duration(cfg.Hz)}
-	var rpcTicker *time.Ticker
-	var rpc <-chan time.Time
-	if cfg.RPCPerSecond > 0 {
-		rpcTicker = time.NewTicker(time.Second / time.Duration(cfg.RPCPerSecond))
-		defer rpcTicker.Stop()
-		rpc = rpcTicker.C
-	}
-	rpcSchedule := scheduledTicker{interval: time.Second / time.Duration(max(cfg.RPCPerSecond, 1))}
-	var bulkTicker *time.Ticker
-	var bulk <-chan time.Time
+func runSGSPClient(ctx context.Context, cfg config, session sgsp.Session, counters *trialCounters, clock benchmarkClock, clientIndex int, correlator *localOverheadCorrelator, measured bool, start <-chan struct{}, ready chan<- error) {
 	var stream sgsp.Stream
 	var streamStop chan struct{}
+	var setupErr error
 	if cfg.BulkBytes > 0 {
 		streamType := benchmarkStreamType
 		if measured {
@@ -1622,9 +1649,7 @@ func runSGSPClient(ctx context.Context, cfg config, session sgsp.Session, counte
 		}
 		opened, err := session.OpenStream(ctx, streamType)
 		if err != nil {
-			if counters.recording() {
-				counters.bulkFailed.Add(1)
-			}
+			setupErr = err
 		} else {
 			stream = opened
 			streamStop = make(chan struct{})
@@ -1638,18 +1663,50 @@ func runSGSPClient(ctx context.Context, cfg config, session sgsp.Session, counte
 				case <-streamStop:
 				}
 			}()
-			bulkTicker = time.NewTicker(10 * time.Millisecond)
-			defer bulkTicker.Stop()
-			bulk = bulkTicker.C
 		}
 	}
-	bulkSchedule := scheduledTicker{interval: 10 * time.Millisecond}
 	defer func() {
 		if stream != nil {
 			close(streamStop)
 			stream.Abort(sgsp.Canceled)
 		}
 	}()
+	if ready != nil {
+		select {
+		case ready <- setupErr:
+		case <-ctx.Done():
+			return
+		}
+	}
+	if setupErr != nil && measured {
+		return
+	}
+	if start != nil {
+		select {
+		case <-start:
+		case <-ctx.Done():
+			return
+		}
+	}
+	inputTicker := time.NewTicker(time.Second / time.Duration(cfg.Hz))
+	defer inputTicker.Stop()
+	inputSchedule := scheduledTicker{interval: time.Second / time.Duration(cfg.Hz)}
+	var rpcTicker *time.Ticker
+	var rpc <-chan time.Time
+	if cfg.RPCPerSecond > 0 {
+		rpcTicker = time.NewTicker(time.Second / time.Duration(cfg.RPCPerSecond))
+		defer rpcTicker.Stop()
+		rpc = rpcTicker.C
+	}
+	rpcSchedule := scheduledTicker{interval: time.Second / time.Duration(max(cfg.RPCPerSecond, 1))}
+	var bulkTicker *time.Ticker
+	var bulk <-chan time.Time
+	if stream != nil {
+		bulkTicker = time.NewTicker(10 * time.Millisecond)
+		defer bulkTicker.Stop()
+		bulk = bulkTicker.C
+	}
+	bulkSchedule := scheduledTicker{interval: 10 * time.Millisecond}
 	var tick, sequence uint64
 	pacer := bulkPacer{perSecond: cfg.BulkBytes}
 	for {
@@ -1737,6 +1794,20 @@ func waitTrial(ctx context.Context, duration time.Duration) bool {
 	case <-ctx.Done():
 		return false
 	}
+}
+
+func waitForWorkloadSetup(ctx context.Context, ready <-chan error, clients int) error {
+	for range clients {
+		select {
+		case err := <-ready:
+			if err != nil {
+				return fmt.Errorf("prepare measured workload: %w", err)
+			}
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		}
+	}
+	return nil
 }
 
 func benchmarkPayload(size int, tick, sequence, stamp uint64) []byte {
