@@ -88,6 +88,18 @@ echo "action_operator_started_utc=$started_utc"
 echo "fresh_checkout=$checkout"
 echo "source_revision=$source_revision"
 
+direct_server_log="$artifacts/direct-server.log"
+direct_client_log="$artifacts/direct-client.log"
+direct_dev_dir="artifacts/direct-dev"
+direct_owner_file="$direct_dev_dir/owner.json"
+owner_a_log="$artifacts/bootstrap-owner-a.log"
+owner_b_log="$artifacts/bootstrap-owner-b.log"
+bootstrap_log="$artifacts/bootstrap.log"
+bootstrap_client_log="$artifacts/bootstrap-client.log"
+bootstrap_dev_dir="artifacts/bootstrap-dev"
+owner_a_file="$bootstrap_dev_dir/owner-a.json"
+owner_b_file="$bootstrap_dev_dir/owner-b.json"
+
 server_pids=()
 servers_stopped=false
 direct_client_exit=null
@@ -246,10 +258,6 @@ run_client() {
   printf '%s\n' "$code"
 }
 
-direct_server_log="$artifacts/direct-server.log"
-direct_client_log="$artifacts/direct-client.log"
-direct_dev_dir="artifacts/direct-dev"
-direct_owner_file="$direct_dev_dir/owner.json"
 start_action "$direct_server_log" -mode server -listen "127.0.0.1:$direct_port" -dev-dir "$direct_dev_dir" -owner-file "$direct_owner_file"
 direct_pid=$started_pid
 if ! wait_for_ready "$direct_pid" "$direct_server_log" 'action owner listening on'; then
@@ -260,13 +268,6 @@ if [[ $direct_client_exit == 0 ]] && rg -q 'update=.*inventory=.*stream=echo:sna
   direct_ok=true
 fi
 
-owner_a_log="$artifacts/bootstrap-owner-a.log"
-owner_b_log="$artifacts/bootstrap-owner-b.log"
-bootstrap_log="$artifacts/bootstrap.log"
-bootstrap_client_log="$artifacts/bootstrap-client.log"
-bootstrap_dev_dir="artifacts/bootstrap-dev"
-owner_a_file="$bootstrap_dev_dir/owner-a.json"
-owner_b_file="$bootstrap_dev_dir/owner-b.json"
 start_action "$owner_a_log" -mode owner -listen "127.0.0.1:$owner_a_port" -dev-dir "$bootstrap_dev_dir" -owner-file "$owner_a_file"
 owner_a_pid=$started_pid
 if ! wait_for_ready "$owner_a_pid" "$owner_a_log" 'action owner listening on'; then
