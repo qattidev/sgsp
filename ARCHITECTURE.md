@@ -1,6 +1,10 @@
 # SGSP v1 — architecture and implementation contract
 
-Status: specification awaiting implementation. No implementation test, race check, fuzz campaign, or performance benchmark is claimed as passed by this document.
+Status: implementation contract with an implemented Go project. Executed
+milestone evidence is retained in `docs/milestones/` and repository-local
+`artifacts/`. M8 release evidence remains incomplete pending a qualifying
+reference-host capacity and impairment campaign; this document does not claim
+that gate has passed.
 
 Read [DESIGN.md](DESIGN.md) for intent. This file defines the technical contract, implementation order, and evidence required to complete the library. If the two documents disagree about a technical detail, this file is authoritative and the design document MUST be corrected in the same change.
 
@@ -14,9 +18,10 @@ When reporting a milestone, name the changed behavior, list the actual commands 
 
 ### 1.1 Workspace and dependencies
 
-The documentation directory is the intended future library root: `/home/sarpojoh/Projects/sgsp`. At documentation creation, `/home/sarpojoh/Projects/go.mod` declares `qattidev/sgsp` with Go `1.27.1`, and the library directory has no module or source code.
-
-Milestone M0 MUST create `sgsp/go.mod` declaring `qattidev/sgsp` and Go `1.27.1`. Run all subsequent Go commands from that directory. Do not move or delete the parent module as part of library implementation. This explicit nested module prevents accidentally including unrelated workspace projects in package discovery.
+The library root is `/home/sarpojoh/Projects/sgsp`. Its `go.mod` declares
+`qattidev/sgsp` with Go `1.27.1`; run all library commands from that directory.
+The module remains deliberately scoped to this repository so package discovery
+does not include unrelated workspace projects.
 
 Use these initial dependency baselines and commit `go.sum`:
 

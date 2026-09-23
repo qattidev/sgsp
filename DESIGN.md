@@ -1,6 +1,10 @@
 # SGSP — Simple Game Server Protocol
 
-Status: proposed version 1 design. These documents specify future implementation; they do not assert that the library or its tests exist.
+Status: version 1 design and implementation contract. The Go implementation
+and its milestone evidence live in this repository; M8 release evidence is
+still incomplete until a qualifying reference-host capacity and impairment
+campaign is retained. See `docs/milestones/` for executed evidence and open
+gates.
 
 Audience: game developers, library implementers, and operators. [ARCHITECTURE.md](ARCHITECTURE.md) is the normative implementation contract and verification handoff.
 
