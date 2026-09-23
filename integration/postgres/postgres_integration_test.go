@@ -22,6 +22,8 @@ import (
 	adapter "qattidev/sgsp/placement/postgres"
 )
 
+const integrationMaxOpenConns = 16
+
 type integrationSigner struct{}
 
 func (integrationSigner) Sign(context.Context, sgsp.Admission) (string, error) {
@@ -101,9 +103,11 @@ func integrationDB(t *testing.T) *sql.DB {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	t.Cleanup(cancel)
 	assertSchemaSearchPath(t, ctx, db, schema)
-	// The probe temporarily holds four connections. Restore the driver's normal
-	// unbounded test-pool limit before concurrent assignment coverage begins.
-	db.SetMaxOpenConns(0)
+	// The probe temporarily holds four connections. Bound the later test pool
+	// so its 100 concurrently started operations exercise transaction races
+	// without exceeding a default PostgreSQL server's client reservation.
+	db.SetMaxOpenConns(integrationMaxOpenConns)
+	db.SetMaxIdleConns(integrationMaxOpenConns)
 	if err := adapter.ApplyMigrations(ctx, db); err != nil {
 		t.Fatal(err)
 	}
