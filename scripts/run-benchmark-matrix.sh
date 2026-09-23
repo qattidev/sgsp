@@ -121,10 +121,20 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 2
 fi
 source_revision=$(git rev-parse HEAD 2>/dev/null || printf 'unknown')
-# Compare the complete worktree to HEAD so both staged and unstaged source
-# edits prevent a resumed run from mixing binaries. The checkout revision alone
-# cannot distinguish a staged build from its unmodified parent.
-source_dirty_hash=$(git diff --no-ext-diff HEAD | sha256sum | awk '{print $1}')
+# Hash every tracked and non-ignored untracked input's current contents. A
+# git-diff hash omits untracked Go sources, which can still change the binaries
+# built below and would otherwise let a resumed campaign mix source snapshots.
+source_snapshot_hash() {
+  git ls-files -co --exclude-standard -z | while IFS= read -r -d '' path; do
+    printf '%s\0' "$path"
+    if [[ -f $path ]]; then
+      sha256sum -- "$path"
+    else
+      printf 'missing\n'
+    fi
+  done | sha256sum | awk '{print $1}'
+}
+source_dirty_hash=$(source_snapshot_hash)
 go_version=$(go version)
 campaign_file="$artifacts/campaign.json"
 campaign_matches() {
