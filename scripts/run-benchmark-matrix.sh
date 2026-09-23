@@ -330,7 +330,23 @@ fi
 echo "matrix_expected_trials=$expected_trials"
 echo "matrix_coverage_failures=$matrix_coverage_failures"
 
-"$bin_dir/sgspbenchreport" --input "$raw_dir" --output "$artifacts/summary.md"
+summary_file="$artifacts/summary.md"
+"$bin_dir/sgspbenchreport" --input "$raw_dir" --output "$summary_file"
+{
+  echo
+  echo '## Campaign context'
+  echo
+  echo '- This report is a measurement index, not a release-gate verdict.'
+  echo '- Campaign manifest: `campaign.json`'
+  echo "- Latest environment manifest: \`$(basename "$environment_file")\`"
+  echo '- Expected trial plan: `expected-trials.tsv`'
+  echo "- Source revision: \`$source_revision\`"
+  echo "- Source snapshot hash: \`$source_dirty_hash\`"
+  echo "- Reference-host validation: \`$reference_host_validation\`"
+  echo "- Expected trials: $expected_trials"
+  echo "- Coverage failures: $matrix_coverage_failures"
+  echo "- Invocation non-completed trials: $non_completed_trials"
+} >> "$summary_file"
 echo "Artifacts written to $artifacts" >&2
 if (( non_completed_trials > 0 || matrix_coverage_failures > 0 )); then
   echo "matrix_non_completed_trials=$non_completed_trials matrix_coverage_failures=$matrix_coverage_failures" >&2
