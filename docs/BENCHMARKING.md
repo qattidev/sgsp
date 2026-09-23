@@ -86,6 +86,12 @@ unless the machine has at least four physical CPU cores, 8 GiB RAM, and
 `SGSPBENCH_GOMAXPROCS=4`. Its environment manifest records the validated core
 and memory values. Leave this setting unset only for constrained-host harness
 diagnostics; those runs cannot establish the architecture's capacity gate.
+WSL2 reports a synthetic core/thread topology. When it does not represent the
+operator-verified physical-core allocation, pass the documented `.wslconfig`
+value with `SGSPBENCH_WSL_PHYSICAL_CORES=N`. The runner accepts this only in a
+detected WSL guest and retains the declaration, synthetic-topology count, and
+available-processor count alongside the memory value; it does not silently
+replace the topology value.
 When this preflight rejects a new artifact destination, the runner retains a
 `reference-host-preflight.json` record there with the source revision,
 available hardware values, reason, and exit code 2, but deliberately creates
