@@ -443,6 +443,7 @@ jq -n \
   echo "- Codec microbenchmark status: \`$(basename "$codec_status_file")\` ($codec_status)"
   echo "- Matrix evaluation: \`$(basename "$evaluation_file")\`"
   echo "- Matrix evaluation status: \`$(basename "$evaluation_status_file")\` ($evaluation_status)"
+  echo '- Evidence checksums: `evidence.sha256`'
   echo "- Source revision: \`$source_revision\`"
   echo "- Source snapshot hash: \`$source_dirty_hash\`"
   echo "- Reference-host validation: \`$reference_host_validation\`"
@@ -450,6 +451,20 @@ jq -n \
   echo "- Coverage failures: $matrix_coverage_failures"
   echo "- Invocation non-completed trials: $non_completed_trials"
 } >> "$summary_file"
+evidence_checksums="$artifacts/evidence.sha256"
+{
+  for evidence_file in "$campaign_file" "$environment_file" "$expected_trials_file" "$codec_log" "$codec_status_file" "$summary_file" "$evaluation_file" "$evaluation_status_file"; do
+    if [[ -f $evidence_file ]]; then
+      sha256sum -- "$evidence_file"
+    else
+      echo "evidence_file_missing=$evidence_file" >&2
+    fi
+  done
+  while IFS= read -r -d '' evidence_file; do
+    sha256sum -- "$evidence_file"
+  done < <(find "$bin_dir" "$raw_dir" -type f -print0 | sort -z)
+} | sort -k2 > "$evidence_checksums"
+echo "evidence_checksums=$evidence_checksums"
 echo "Artifacts written to $artifacts" >&2
 if (( non_completed_trials > 0 || matrix_coverage_failures > 0 || codec_exit_code > 0 || evaluation_exit_code > 0 )); then
   echo "matrix_non_completed_trials=$non_completed_trials matrix_coverage_failures=$matrix_coverage_failures codec_exit_code=$codec_exit_code evaluation_exit_code=$evaluation_exit_code" >&2
