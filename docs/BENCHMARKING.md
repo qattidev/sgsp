@@ -34,8 +34,11 @@ post-write outcomes. Warmup and measured generators are separate phases:
 measurement inputs and requests carry a phase marker and measured bulk uses a
 separate stream type, so late warmup traffic cannot increase measured offered,
 accepted, or delivered counts. Measured bulk streams are prepared before the
-timer starts and released together with the other generators. The result also
-records scheduled and missed input, request, and bulk ticks. A missed tick
+timer starts and released together with the other generators. Each client then
+uses a small deterministic start phase across the shortest active ticker
+period, preventing an artificial all-client timer burst while preserving every
+client's configured steady-state rate. The result also records scheduled and
+missed input, request, and bulk ticks. A missed tick
 marks the trial invalid rather than hiding generator shortfall behind a lower
 offered rate. On Linux CPU time is user plus system process time; on other
 platforms a zero value means that this dependency-free collector is

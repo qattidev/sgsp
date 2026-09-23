@@ -65,6 +65,31 @@ func TestScheduledTickerCountsCoalescedTicks(t *testing.T) {
 	}
 }
 
+func TestWorkloadStartPhaseSpreadsClientsAcrossActivePeriod(t *testing.T) {
+	withBulk := config{Clients: 32, Hz: 128, BulkBytes: 64 << 10}
+	period := 10 * time.Millisecond
+	if inputPeriod := time.Second / time.Duration(withBulk.Hz); inputPeriod < period {
+		period = inputPeriod
+	}
+	if got := workloadStartPhase(withBulk, 0); got != 0 {
+		t.Fatalf("client zero phase = %s, want zero", got)
+	}
+	if got := workloadStartPhase(withBulk, 1); got <= 0 || got >= period {
+		t.Fatalf("client one phase = %s, want within (0, %s)", got, period)
+	}
+	if got, want := workloadStartPhase(withBulk, 7), workloadStartPhase(withBulk, 0); got != want {
+		t.Fatalf("phase should repeat after available millisecond slots: client 7 = %s, client 0 = %s", got, want)
+	}
+
+	withoutBulk := config{Clients: 8, Hz: 60}
+	if got := workloadStartPhase(withoutBulk, 1); got <= 0 || got >= time.Second/time.Duration(withoutBulk.Hz) {
+		t.Fatalf("input-only phase = %s, want within input period", got)
+	}
+	if got := workloadStartPhase(config{Clients: 1, Hz: 60, BulkBytes: 64 << 10}, 0); got != 0 {
+		t.Fatalf("single-client phase = %s, want zero", got)
+	}
+}
+
 func TestBenchmarkWorkloadPhaseMarkers(t *testing.T) {
 	measured := benchmarkPayloadForClientPhase(32, 7, 9, 11, 3, true)
 	if !benchmarkPayloadIsMeasuredFromPayload(measured) {
