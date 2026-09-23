@@ -22,6 +22,9 @@ Artifacts always remain below this checkout's artifacts/ directory; /tmp is
 not a valid destination. Set SGSPBENCH_IMPAIRED_CLIENTS only after
 identifying a healthy capacity. Resume only continues a campaign whose
 configuration and source snapshot match its campaign.json manifest.
+
+The script renders and retains all trial results even when a trial is invalid
+or fails, then exits nonzero if any recorded trial is non-completed.
 USAGE
   exit 0
 fi
@@ -142,6 +145,7 @@ echo "environment_manifest=$environment_file"
 
 GOMAXPROCS="$gomaxprocs" go build -trimpath -o "$bin_dir/sgspbench" ./cmd/sgspbench
 GOMAXPROCS="$gomaxprocs" go build -trimpath -o "$bin_dir/sgspbenchreport" ./cmd/sgspbenchreport
+non_completed_trials=0
 
 run_trial() {
   local implementation=$1 clients=$2 hz=$3 rtt=$4 loss=$5 jitter=$6 reorder=$7 seed=$8 profile=$9
@@ -159,11 +163,19 @@ run_trial() {
     echo "resume_skip=$file"
     return
   fi
-  GOMAXPROCS="$gomaxprocs" "$bin_dir/sgspbench" \
+  if GOMAXPROCS="$gomaxprocs" "$bin_dir/sgspbench" \
     --implementation "$implementation" --clients "$clients" --hz "$hz" \
     --input-bytes 64 --update-bytes 512 --rpc-per-second 2 --bulk-bytes-per-second 65536 \
     --warmup "$warmup" --duration "$duration" --rtt "$rtt" --jitter "$jitter" \
-    --loss "$loss" --reorder "$reorder" --seed "$seed" --output "$file"
+    --loss "$loss" --reorder "$reorder" --seed "$seed" --output "$file"; then
+    return
+  fi
+  non_completed_trials=$((non_completed_trials + 1))
+  echo "trial_non_completed=$file"
+  if [[ ! -s $file ]]; then
+    echo "trial failed without a result file: $file" >&2
+  fi
+  return 0
 }
 
 run_point() {
@@ -198,3 +210,7 @@ fi
 
 "$bin_dir/sgspbenchreport" --input "$raw_dir" --output "$artifacts/summary.md"
 echo "Artifacts written to $artifacts" >&2
+if (( non_completed_trials > 0 )); then
+  echo "matrix_non_completed_trials=$non_completed_trials" >&2
+  exit 1
+fi

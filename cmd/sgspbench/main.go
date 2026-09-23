@@ -65,26 +65,30 @@ func main() {
 	value := result{Config: cfg, GoVersion: runtime.Version(), Timestamp: time.Now().UTC()}
 	measurement, err := runTrial(context.Background(), cfg)
 	value.Measurement = measurement
+	var exitCode int
+	value.Status, value.Error, exitCode = trialOutcome(measurement, err)
+	writeResult(output, value)
+	if exitCode != 0 {
+		fmt.Fprintln(os.Stderr, "sgspbench:", value.Error)
+		os.Exit(exitCode)
+	}
+}
+
+// trialOutcome keeps the JSON status and command exit contract aligned. An
+// invalid sample is evidence to retain, but it is not a successful benchmark
+// invocation: callers such as the matrix runner must be able to fail a gate
+// while continuing to collect the remaining trial records.
+func trialOutcome(measurement measurement, err error) (status, message string, exitCode int) {
 	if err != nil {
-		value.Status, value.Error = trialStatus(err), err.Error()
-		writeResult(output, value)
-		fmt.Fprintln(os.Stderr, "sgspbench:", err)
-		os.Exit(1)
+		return trialStatus(err), err.Error(), 1
 	}
 	if measurement.Validity.InputSampleBufferOverflow || measurement.Validity.UpdateSampleBufferOverflow {
-		value.Status = "invalid"
-		value.Error = "correlated directional local-overhead sample buffer overflow"
-		writeResult(output, value)
-		return
+		return "invalid", "correlated directional local-overhead sample buffer overflow", 1
 	}
 	if measurement.Generator.Unable {
-		value.Status = "invalid"
-		value.Error = "workload generator missed scheduled ticks"
-		writeResult(output, value)
-		return
+		return "invalid", "workload generator missed scheduled ticks", 1
 	}
-	value.Status = "completed"
-	writeResult(output, value)
+	return "completed", "", 0
 }
 func validate(cfg config, output string) error {
 	if cfg.Implementation != "sgsp" && cfg.Implementation != "quic" {
