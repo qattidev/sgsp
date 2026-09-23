@@ -17,12 +17,13 @@ Environment overrides:
   SGSPBENCH_REFERENCE_HOST=1       require the release-gate host minimums
   SGSPBENCH_RESUME=1               continue a matching interrupted campaign
 
-The script builds reproducible local binaries, runs five seeds for each
-healthy and impairment point, stores JSON under raw/, and writes summary.md.
-Artifacts always remain below this checkout's artifacts/ directory; /tmp is
-not a valid destination. Set SGSPBENCH_IMPAIRED_CLIENTS only after
-identifying a healthy capacity. Resume only continues a campaign whose
-configuration and source snapshot match its campaign.json manifest.
+The script builds reproducible local binaries, retains the raw-vs-JSON codec
+microbenchmark, runs five seeds for each healthy and impairment point, stores
+JSON under raw/, and writes summary.md. Artifacts always remain below this
+checkout's artifacts/ directory; /tmp is not a valid destination. Set
+SGSPBENCH_IMPAIRED_CLIENTS only after identifying a healthy capacity. Resume
+only continues a campaign whose configuration and source snapshot match its
+campaign.json manifest.
 
 Set SGSPBENCH_REFERENCE_HOST=1 for release capacity evidence. It requires
 GOMAXPROCS=4, at least four physical CPU cores, and at least 8 GiB of RAM
@@ -115,7 +116,8 @@ verify_reference_host() {
 verify_reference_host
 bin_dir="$artifacts/bin"
 raw_dir="$artifacts/raw"
-mkdir -p "$bin_dir" "$raw_dir"
+go_cache_dir="$artifacts/go-cache"
+mkdir -p "$bin_dir" "$raw_dir" "$go_cache_dir"
 if ! command -v jq >/dev/null 2>&1; then
   echo "jq is required to create and validate the local campaign manifest" >&2
   exit 2
@@ -203,6 +205,7 @@ fi
   echo "reference_host_physical_cores=$reference_host_physical_cores"
   echo "reference_host_memory_kib=$reference_host_memory_kib"
   echo "build_flags=-trimpath"
+  echo "go_cache=$go_cache_dir"
   # Keep copy-and-pasteable commands with the evidence rather than requiring
   # an auditor to reconstruct them from flags and binary paths.
   printf 'build_sgspbench_command=GOMAXPROCS=%q go build -trimpath -o %q ./cmd/sgspbench\n' \
@@ -223,8 +226,33 @@ fi
 } > "$environment_file"
 echo "environment_manifest=$environment_file"
 
-GOMAXPROCS="$gomaxprocs" go build -trimpath -o "$bin_dir/sgspbench" ./cmd/sgspbench
-GOMAXPROCS="$gomaxprocs" go build -trimpath -o "$bin_dir/sgspbenchreport" ./cmd/sgspbenchreport
+GOCACHE="$go_cache_dir" GOMAXPROCS="$gomaxprocs" go build -trimpath -o "$bin_dir/sgspbench" ./cmd/sgspbench
+GOCACHE="$go_cache_dir" GOMAXPROCS="$gomaxprocs" go build -trimpath -o "$bin_dir/sgspbenchreport" ./cmd/sgspbenchreport
+codec_log="$artifacts/codec-benchmark-$run_stamp.txt"
+codec_status_file="$artifacts/codec-benchmark-$run_stamp.status.json"
+codec_started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+printf 'codec_benchmark_command=GOCACHE=%q GOMAXPROCS=%q go test -run %q -bench %q -benchmem .\n' \
+  "$go_cache_dir" "$gomaxprocs" '^$' '^BenchmarkCodec' | tee "$codec_log"
+set +e
+GOCACHE="$go_cache_dir" GOMAXPROCS="$gomaxprocs" \
+  go test -run '^$' -bench '^BenchmarkCodec' -benchmem . 2>&1 | tee -a "$codec_log"
+codec_exit_code=${PIPESTATUS[0]}
+set -e
+codec_completed_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+codec_status=completed
+if [[ $codec_exit_code -ne 0 ]]; then
+  codec_status=failed
+fi
+jq -n \
+  --arg status "$codec_status" \
+  --arg started_utc "$codec_started_utc" \
+  --arg completed_utc "$codec_completed_utc" \
+  --arg log "$codec_log" \
+  --arg command "go test -run '^\$' -bench '^BenchmarkCodec' -benchmem ." \
+  --argjson exit_code "$codec_exit_code" \
+  '{schema: 1, status: $status, started_utc: $started_utc, completed_utc: $completed_utc,
+    exit_code: $exit_code, log: $log, command: $command}' > "$codec_status_file"
+echo "codec_benchmark_status=$codec_status_file status=$codec_status exit_code=$codec_exit_code"
 non_completed_trials=0
 expected_trials_file="$artifacts/expected-trials.tsv"
 : > "$expected_trials_file"
@@ -340,6 +368,8 @@ summary_file="$artifacts/summary.md"
   echo '- Campaign manifest: `campaign.json`'
   echo "- Latest environment manifest: \`$(basename "$environment_file")\`"
   echo '- Expected trial plan: `expected-trials.tsv`'
+  echo "- Codec microbenchmark log: \`$(basename "$codec_log")\`"
+  echo "- Codec microbenchmark status: \`$(basename "$codec_status_file")\` ($codec_status)"
   echo "- Source revision: \`$source_revision\`"
   echo "- Source snapshot hash: \`$source_dirty_hash\`"
   echo "- Reference-host validation: \`$reference_host_validation\`"
@@ -348,7 +378,7 @@ summary_file="$artifacts/summary.md"
   echo "- Invocation non-completed trials: $non_completed_trials"
 } >> "$summary_file"
 echo "Artifacts written to $artifacts" >&2
-if (( non_completed_trials > 0 || matrix_coverage_failures > 0 )); then
-  echo "matrix_non_completed_trials=$non_completed_trials matrix_coverage_failures=$matrix_coverage_failures" >&2
+if (( non_completed_trials > 0 || matrix_coverage_failures > 0 || codec_exit_code > 0 )); then
+  echo "matrix_non_completed_trials=$non_completed_trials matrix_coverage_failures=$matrix_coverage_failures codec_exit_code=$codec_exit_code" >&2
   exit 1
 fi
