@@ -315,6 +315,79 @@ echo "matrix_command=$0 $artifact_argument"
 run_started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 run_stamp=$(date -u +%Y%m%dT%H%M%SZ)
 echo "matrix_started_utc=$run_started_utc"
+matrix_status_file="$artifacts/matrix-$run_stamp.status.json"
+matrix_status_written=false
+matrix_phase=initializing
+codec_exit_code=null
+codec_status=pending
+evaluation_exit_code=null
+evaluation_status=pending
+non_completed_trials=0
+matrix_coverage_failures=0
+expected_trials=0
+expected_trials_file="$artifacts/expected-trials.tsv"
+: > "$expected_trials_file"
+
+write_matrix_status() {
+  local status=$1
+  local exit_code=$2
+  local reason=${3:-}
+  local completed_utc
+  local expected_rows=0
+  local raw_result_files=0
+  completed_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  if [[ -f $expected_trials_file ]]; then
+    expected_rows=$(wc -l < "$expected_trials_file")
+  fi
+  if [[ -d $raw_dir ]]; then
+    raw_result_files=$(find "$raw_dir" -type f -name '*.json' | wc -l)
+  fi
+  jq -n \
+    --arg status "$status" \
+    --arg phase "$matrix_phase" \
+    --arg reason "$reason" \
+    --arg started_utc "$run_started_utc" \
+    --arg completed_utc "$completed_utc" \
+    --arg source_revision "$source_revision" \
+    --arg campaign "$campaign_file" \
+    --arg expected_trials_file "$expected_trials_file" \
+    --argjson exit_code "$exit_code" \
+    --argjson expected_trial_rows "$expected_rows" \
+    --argjson raw_result_files "$raw_result_files" \
+    --argjson non_completed_trials "$non_completed_trials" \
+    --argjson matrix_coverage_failures "$matrix_coverage_failures" \
+    --argjson codec_exit_code "$codec_exit_code" \
+    --argjson evaluation_exit_code "$evaluation_exit_code" \
+    '{schema: 1, status: $status, phase: $phase, reason: $reason,
+      started_utc: $started_utc, completed_utc: $completed_utc,
+      source_revision: $source_revision, campaign: $campaign,
+      expected_trials_file: $expected_trials_file, exit_code: $exit_code,
+      expected_trial_rows: $expected_trial_rows, raw_result_files: $raw_result_files,
+      non_completed_trials: $non_completed_trials,
+      matrix_coverage_failures: $matrix_coverage_failures,
+      codec_exit_code: $codec_exit_code, evaluation_exit_code: $evaluation_exit_code}' > "$matrix_status_file"
+  matrix_status_written=true
+  echo "matrix_status=$matrix_status_file status=$status phase=$matrix_phase"
+}
+
+on_matrix_signal() {
+  local signal=$1
+  local exit_code=$2
+  write_matrix_status interrupted "$exit_code" "received $signal"
+  trap - EXIT INT TERM HUP
+  exit "$exit_code"
+}
+
+on_matrix_exit() {
+  local exit_code=$1
+  if [[ $matrix_status_written != true ]]; then
+    write_matrix_status failed "$exit_code" "runner exited without final evaluation"
+  fi
+}
+trap 'on_matrix_signal INT 130' INT
+trap 'on_matrix_signal TERM 143' TERM
+trap 'on_matrix_signal HUP 129' HUP
+trap 'on_matrix_exit $?' EXIT
 
 environment_file="$artifacts/environment.txt"
 if [[ -e $environment_file ]]; then
@@ -359,6 +432,7 @@ echo "environment_manifest=$environment_file"
 GOCACHE="$go_cache_dir" GOMAXPROCS="$gomaxprocs" go build -trimpath -o "$bin_dir/sgspbench" ./cmd/sgspbench
 GOCACHE="$go_cache_dir" GOMAXPROCS="$gomaxprocs" go build -trimpath -o "$bin_dir/sgspbenchreport" ./cmd/sgspbenchreport
 GOCACHE="$go_cache_dir" GOMAXPROCS="$gomaxprocs" go build -trimpath -o "$bin_dir/sgspbencheval" ./cmd/sgspbencheval
+matrix_phase=codec_benchmark
 codec_log="$artifacts/codec-benchmark-$run_stamp.txt"
 codec_status_file="$artifacts/codec-benchmark-$run_stamp.status.json"
 codec_started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -384,9 +458,7 @@ jq -n \
   '{schema: 1, status: $status, started_utc: $started_utc, completed_utc: $completed_utc,
     exit_code: $exit_code, log: $log, command: $command}' > "$codec_status_file"
 echo "codec_benchmark_status=$codec_status_file status=$codec_status exit_code=$codec_exit_code"
-non_completed_trials=0
-expected_trials_file="$artifacts/expected-trials.tsv"
-: > "$expected_trials_file"
+matrix_phase=trials
 
 run_trial() {
   local implementation=$1 clients=$2 hz=$3 rtt=$4 loss=$5 jitter=$6 reorder=$7 seed=$8 profile=$9
@@ -466,8 +538,7 @@ else
   done
 fi
 
-matrix_coverage_failures=0
-expected_trials=0
+matrix_phase=coverage_check
 while IFS=$'\t' read -r implementation clients hz rtt rtt_ns loss jitter jitter_ns reorder seed profile duration_ns file; do
   expected_trials=$((expected_trials + 1))
   if [[ ! -s $file ]]; then
@@ -508,6 +579,7 @@ echo "matrix_coverage_failures=$matrix_coverage_failures"
 
 summary_file="$artifacts/summary.md"
 "$bin_dir/sgspbenchreport" --input "$raw_dir" --output "$summary_file"
+matrix_phase=evaluation
 evaluation_file="$artifacts/evaluation.md"
 evaluation_status_file="$artifacts/evaluation-$run_stamp.status.json"
 evaluation_started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -549,6 +621,7 @@ jq -n \
   echo "- Coverage failures: $matrix_coverage_failures"
   echo "- Invocation non-completed trials: $non_completed_trials"
 } >> "$summary_file"
+matrix_phase=checksumming
 evidence_checksums="$artifacts/evidence.sha256"
 {
   for evidence_file in "$campaign_file" "$environment_file" "$expected_trials_file" "$codec_log" "$codec_status_file" "$summary_file" "$evaluation_file" "$evaluation_status_file"; do
@@ -565,6 +638,12 @@ evidence_checksums="$artifacts/evidence.sha256"
 echo "evidence_checksums=$evidence_checksums"
 echo "Artifacts written to $artifacts" >&2
 if (( non_completed_trials > 0 || matrix_coverage_failures > 0 || codec_exit_code > 0 || evaluation_exit_code > 0 )); then
+  matrix_phase=complete
+  write_matrix_status failed 1 "one or more trials, coverage checks, codec benchmarks, or evaluation steps did not complete"
   echo "matrix_non_completed_trials=$non_completed_trials matrix_coverage_failures=$matrix_coverage_failures codec_exit_code=$codec_exit_code evaluation_exit_code=$evaluation_exit_code" >&2
+  trap - EXIT INT TERM HUP
   exit 1
 fi
+matrix_phase=complete
+write_matrix_status completed 0
+trap - EXIT INT TERM HUP
