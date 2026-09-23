@@ -176,21 +176,19 @@ jq -n \
     protocol_missing_tests: $protocol_missing, protocol_passes: $protocol_passes,
     reconnect_exit_code: $reconnect_exit_code, reconnect_pass_count: $reconnect_pass_count}' > "$status_file"
 summary_file="$artifacts/summary.md"
-cat > "$summary_file" <<SUMMARY
-# M8 functional evidence
-
-- status: $evidence_status
-- protocol race repetitions: $race_count
-- protocol pass events: $protocol_passes / $((race_count * ${#protocol_tests[@]}))
-- protocol tests missing complete repetition coverage: $protocol_missing
-- reconnect blackhole pass events: $reconnect_pass_count / 1
-- protocol JSON: `protocol-race.json`
-- reconnect JSON: `reconnect-blackhole.json`
-
-This validates protocol invariants and bounded reconnect behavior. It does not
-establish the section-12 reference-host capacity, impairment, or SGSP-vs-QUIC
-performance gates; those require a qualifying benchmark matrix campaign.
-SUMMARY
+{
+  printf '%s\n\n' '# M8 functional evidence'
+  printf '%s\n' "- status: $evidence_status"
+  printf '%s\n' "- protocol race repetitions: $race_count"
+  printf '%s\n' "- protocol pass events: $protocol_passes / $((race_count * ${#protocol_tests[@]}))"
+  printf '%s\n' "- protocol tests missing complete repetition coverage: $protocol_missing"
+  printf '%s\n' "- reconnect blackhole pass events: $reconnect_pass_count / 1"
+  printf '%s\n' '- protocol JSON: `protocol-race.json`'
+  printf '%s\n\n' '- reconnect JSON: `reconnect-blackhole.json`'
+  printf '%s\n' 'This validates protocol invariants and bounded reconnect behavior. It does not'
+  printf '%s\n' 'establish the section-12 reference-host capacity, impairment, or SGSP-vs-QUIC'
+  printf '%s\n' 'performance gates; those require a qualifying benchmark matrix campaign.'
+} > "$summary_file"
 echo "functional_evidence_status=$status_file status=$evidence_status"
 if [[ $evidence_status != completed ]]; then
   exit 1
