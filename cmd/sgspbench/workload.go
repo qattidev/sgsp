@@ -374,31 +374,6 @@ func (t *scheduledTicker) Observe(at time.Time) uint64 {
 	return missed
 }
 
-// workloadStartPhase spreads clients over the shortest active periodic
-// workload interval. A trial releases its client generators from one boundary;
-// creating every ticker immediately would make their input and 10 ms bulk
-// work fire in lockstep. That artificial burst can coalesce ticker events
-// before the transport has a chance to run. A phase is at least roughly one
-// scheduler quantum, while every client retains the same ticker interval and
-// therefore its configured steady-state rate.
-func workloadStartPhase(cfg config, clientIndex int) time.Duration {
-	if cfg.Clients <= 1 || clientIndex <= 0 || cfg.Hz <= 0 {
-		return 0
-	}
-	period := time.Second / time.Duration(cfg.Hz)
-	if cfg.BulkBytes > 0 && 10*time.Millisecond < period {
-		period = 10 * time.Millisecond
-	}
-	slots := int(period / time.Millisecond)
-	if slots < 2 {
-		return 0
-	}
-	if cfg.Clients < slots {
-		slots = cfg.Clients
-	}
-	return time.Duration(clientIndex%slots) * period / time.Duration(slots)
-}
-
 const maxCorrelatedSamplesPerClient = 8_192
 
 type correlatedOverheadSample struct {
@@ -1376,9 +1351,6 @@ func runBareQUICClient(ctx context.Context, cfg config, connection transport.Con
 			return
 		}
 	}
-	if !waitTrial(ctx, workloadStartPhase(cfg, clientIndex)) {
-		return
-	}
 	inputTicker := time.NewTicker(time.Second / time.Duration(cfg.Hz))
 	defer inputTicker.Stop()
 	inputSchedule := scheduledTicker{interval: time.Second / time.Duration(cfg.Hz)}
@@ -1720,9 +1692,6 @@ func runSGSPClient(ctx context.Context, cfg config, session sgsp.Session, counte
 		case <-ctx.Done():
 			return
 		}
-	}
-	if !waitTrial(ctx, workloadStartPhase(cfg, clientIndex)) {
-		return
 	}
 	inputTicker := time.NewTicker(time.Second / time.Duration(cfg.Hz))
 	defer inputTicker.Stop()
