@@ -18,8 +18,41 @@ import (
 
 	"qattidev/sgsp"
 	"qattidev/sgsp/placement"
+	"qattidev/sgsp/placement/memory"
 	adapter "qattidev/sgsp/placement/postgres"
 )
+
+type integrationSigner struct{}
+
+func (integrationSigner) Sign(context.Context, sgsp.Admission) (string, error) {
+	return "integration-ticket", nil
+}
+
+func integrationOwner(id byte) sgsp.Owner {
+	return sgsp.Owner{
+		ID:          string(rune('a' + id)),
+		Incarnation: sgsp.Incarnation{id},
+		Endpoint: sgsp.Endpoint{
+			Address:    fmt.Sprintf("127.0.0.1:%d", 4100+int(id)),
+			ServerName: fmt.Sprintf("owner-%d", id),
+		},
+	}
+}
+
+func integrationBootstrap(t *testing.T, app sgsp.AppIdentity, store placement.AssignmentStore, registry placement.Registry) *placement.Bootstrap {
+	t.Helper()
+	bootstrap, err := placement.NewBootstrap(placement.BootstrapConfig{
+		App:      app,
+		Store:    store,
+		Registry: registry,
+		Signer:   integrationSigner{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(bootstrap.Close)
+	return bootstrap
+}
 
 // integrationDB creates and later removes only a unique schema owned by this
 // test run. A missing URL intentionally fails rather than passing a skipped
@@ -178,6 +211,147 @@ func TestConcurrentAssignment(t *testing.T) {
 	}
 	if winner.ID == "" {
 		t.Fatal("no assignment winner")
+	}
+}
+
+func TestConcurrentBootstrapResolve(t *testing.T) {
+	db := integrationDB(t)
+	firstStore, err := adapter.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondStore, err := adapter.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := sgsp.AppIdentity{ID: "integration", Version: "1"}
+	registry := memory.NewRegistry()
+	for id := byte(0); id < 3; id++ {
+		if err := registry.Register(context.Background(), integrationOwner(id)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first := integrationBootstrap(t, app, firstStore, registry)
+	second := integrationBootstrap(t, app, secondStore, registry)
+	principal := sgsp.Principal{Issuer: "integration", Subject: "player", ExpiresAt: time.Now().Add(time.Minute)}
+
+	const attempts = 100
+	start := make(chan struct{})
+	placements := make(chan placement.Placement, attempts)
+	errs := make(chan error, attempts)
+	var ready, workers sync.WaitGroup
+	for index := 0; index < attempts; index++ {
+		ready.Add(1)
+		workers.Add(1)
+		bootstrap := first
+		if index%2 == 1 {
+			bootstrap = second
+		}
+		go func(bootstrap *placement.Bootstrap) {
+			defer workers.Done()
+			ready.Done()
+			<-start
+			resolved, err := bootstrap.Resolve(context.Background(), principal, "shared-winner")
+			if err != nil {
+				errs <- err
+				return
+			}
+			placements <- resolved
+		}(bootstrap)
+	}
+	ready.Wait()
+	close(start)
+	workers.Wait()
+	close(placements)
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	var winner sgsp.Owner
+	for resolved := range placements {
+		if resolved.AdmissionTicket == "" {
+			t.Fatal("bootstrap returned an empty admission ticket")
+		}
+		if winner.ID == "" {
+			winner = resolved.Owner
+		}
+		if resolved.Owner != winner {
+			t.Fatalf("bootstrap winner changed: %#v != %#v", resolved.Owner, winner)
+		}
+	}
+	if winner.ID == "" {
+		t.Fatal("no bootstrap assignment winner")
+	}
+	stored, err := firstStore.Get(context.Background(), placement.GroupID{App: app, Key: "shared-winner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Closed || stored.Owner != winner {
+		t.Fatalf("stored bootstrap assignment = %#v, want open winner %#v", stored, winner)
+	}
+}
+
+func TestBootstrapCloseRace(t *testing.T) {
+	db := integrationDB(t)
+	firstStore, err := adapter.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondStore, err := adapter.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := sgsp.AppIdentity{ID: "integration", Version: "1"}
+	registry := memory.NewRegistry()
+	for id := byte(0); id < 3; id++ {
+		if err := registry.Register(context.Background(), integrationOwner(id)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first := integrationBootstrap(t, app, firstStore, registry)
+	second := integrationBootstrap(t, app, secondStore, registry)
+	principal := sgsp.Principal{Issuer: "integration", Subject: "player", ExpiresAt: time.Now().Add(time.Minute)}
+	assigned, err := first.Resolve(context.Background(), principal, "close-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const attempts = 100
+	start := make(chan struct{})
+	errs := make(chan error, attempts)
+	var ready, workers sync.WaitGroup
+	for index := 0; index < attempts; index++ {
+		ready.Add(1)
+		workers.Add(1)
+		bootstrap := first
+		if index%2 == 1 {
+			bootstrap = second
+		}
+		go func(bootstrap *placement.Bootstrap) {
+			defer workers.Done()
+			ready.Done()
+			<-start
+			errs <- bootstrap.CloseGroup(context.Background(), "close-race", assigned.Owner)
+		}(bootstrap)
+	}
+	ready.Wait()
+	close(start)
+	workers.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := second.Resolve(context.Background(), principal, "close-race"); !errors.Is(err, sgsp.ErrGroupClosed) {
+		t.Fatalf("closed group bootstrap resolve = %v, want ErrGroupClosed", err)
+	}
+	stored, err := firstStore.Get(context.Background(), placement.GroupID{App: app, Key: "close-race"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stored.Closed || stored.Owner != assigned.Owner {
+		t.Fatalf("stored closed assignment = %#v, want closed owner %#v", stored, assigned.Owner)
 	}
 }
 
