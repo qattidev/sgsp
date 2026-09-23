@@ -67,13 +67,54 @@ func integrationDB(t *testing.T) *sql.DB {
 	t.Cleanup(func() { _ = db.Close() })
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	t.Cleanup(cancel)
+	assertSchemaSearchPath(t, ctx, db, schema)
+	// The probe temporarily holds four connections. Restore the driver's normal
+	// unbounded test-pool limit before concurrent assignment coverage begins.
+	db.SetMaxOpenConns(0)
 	if err := adapter.ApplyMigrations(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 	if err := adapter.ApplyMigrations(ctx, db); err != nil {
 		t.Fatalf("migration reapplication = %v", err)
 	}
+	var migrationSchema string
+	if err := db.QueryRowContext(ctx, `SELECT n.nspname
+        FROM pg_class AS c
+        JOIN pg_namespace AS n ON n.oid = c.relnamespace
+        WHERE c.oid = 'sgsp_schema_migrations'::regclass`).Scan(&migrationSchema); err != nil {
+		t.Fatal(err)
+	}
+	if migrationSchema != schema {
+		t.Fatalf("migration schema = %q, want disposable schema %q", migrationSchema, schema)
+	}
 	return db
+}
+
+func assertSchemaSearchPath(t *testing.T, ctx context.Context, db *sql.DB, schema string) {
+	t.Helper()
+	db.SetMaxOpenConns(4)
+	connections := make([]*sql.Conn, 0, 4)
+	defer func() {
+		for _, connection := range connections {
+			_ = connection.Close()
+		}
+	}()
+	for range 4 {
+		connection, err := db.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		connections = append(connections, connection)
+	}
+	for _, connection := range connections {
+		var currentSchema string
+		if err := connection.QueryRowContext(ctx, `SELECT current_schema()`).Scan(&currentSchema); err != nil {
+			t.Fatal(err)
+		}
+		if currentSchema != schema {
+			t.Fatalf("connection search_path selected schema %q, want %q", currentSchema, schema)
+		}
+	}
 }
 
 func quoteIdentifier(value string) string { return `"` + strings.ReplaceAll(value, `"`, `""`) + `"` }
