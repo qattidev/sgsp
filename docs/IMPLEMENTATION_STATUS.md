@@ -110,7 +110,7 @@ reported as passed:
   1,000-cycle shutdown-cleanup test (request, loss, explicit resume, close,
   no retained session/application budget, and post-GC heap tolerance) are
   present;
-- M8 capacity, impairment, plateau, and published comparison evidence. The
+- M8 capacity, impairment, and published comparison evidence. The
   benchmark harness now runs SGSP and bare-QUIC trials through deterministic
   per-client two-socket UDP relays with bounded timing histograms, correlated
   directional local budgets, queue/drop and relay-backlog observations, and
@@ -138,9 +138,19 @@ bulk ticks were missed. The subsequent
 `artifacts/measurement-nonzero-smoke-20260923/` additionally confirms that
 all 20 invalid JSON records and the report are retained before the runner
 returns a nonzero failed-gate exit. These are harness diagnostics, not
-performance results. The five-seed 60-second capacity and plateau campaign,
-full impairment matrix at half that capacity, and published comparison remain
+performance results. The five-seed 60-second capacity campaign, full
+impairment matrix at half that capacity, and published comparison remain
 incomplete.
+
+The retained local `artifacts/resource-plateau-10m-rerun-20260923/` campaign
+does cover the separate ten-minute slow-consumer plateau component. At source
+revision `15cee65`, its explicit 12-minute Go test deadline allowed orderly
+teardown after a ten-minute workload: 2,337 cycles and 19 post-warm samples
+all retained zero sessions and zero application-budget bytes. Heap grew from a
+816,496 B warmed baseline to 871,104 B peak (within the 2 MiB bound), and
+teardown was 629,328 B; goroutines were 13 at the baseline and peak and 2 at
+teardown. The previous ten-minute artifact, interrupted during cleanup by the
+old default Go test timeout, remains retained as failed harness evidence.
 
 `TestReconnectBlackholeDurations` now performs the required real UDP-relay
 blackholes for 2, 8, and 40 seconds. The locally retained JSON record at
