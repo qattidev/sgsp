@@ -106,25 +106,32 @@ esac
 reference_host_validation=not_requested
 reference_host_physical_cores=unknown
 reference_host_memory_kib=unknown
+reference_host_error=
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required to create and validate local benchmark evidence" >&2
+  exit 2
+fi
+source_revision=$(git rev-parse HEAD 2>/dev/null || printf 'unknown')
+go_version=$(go version)
 verify_reference_host() {
   if [[ $reference_host != 1 ]]; then
     return
   fi
   if [[ $gomaxprocs != 4 ]]; then
-    echo "reference-host capacity evidence requires SGSPBENCH_GOMAXPROCS=4; got $gomaxprocs" >&2
-    exit 2
+    reference_host_error="reference-host capacity evidence requires SGSPBENCH_GOMAXPROCS=4; got $gomaxprocs"
+    return 1
   fi
   if command -v lscpu >/dev/null 2>&1; then
     reference_host_physical_cores=$(lscpu -p=CORE,SOCKET | awk -F, '$1 !~ /^#/ { seen[$1 "," $2] = 1 } END { for (key in seen) { count++ } print count }')
   elif [[ $(uname -s) == Darwin ]] && command -v sysctl >/dev/null 2>&1; then
     reference_host_physical_cores=$(sysctl -n hw.physicalcpu)
   else
-    echo "reference-host capacity evidence requires lscpu or macOS sysctl to verify physical cores" >&2
-    exit 2
+    reference_host_error="reference-host capacity evidence requires lscpu or macOS sysctl to verify physical cores"
+    return 1
   fi
   if ! [[ $reference_host_physical_cores =~ ^[0-9]+$ ]] || (( reference_host_physical_cores < 4 )); then
-    echo "reference-host capacity evidence requires at least four physical cores; got $reference_host_physical_cores" >&2
-    exit 2
+    reference_host_error="reference-host capacity evidence requires at least four physical cores; got $reference_host_physical_cores"
+    return 1
   fi
   if [[ -r /proc/meminfo ]]; then
     reference_host_memory_kib=$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo)
@@ -134,25 +141,49 @@ verify_reference_host() {
       reference_host_memory_kib=$((reference_host_memory_bytes / 1024))
     fi
   else
-    echo "reference-host capacity evidence requires /proc/meminfo or macOS sysctl to verify RAM" >&2
-    exit 2
+    reference_host_error="reference-host capacity evidence requires /proc/meminfo or macOS sysctl to verify RAM"
+    return 1
   fi
   if ! [[ $reference_host_memory_kib =~ ^[0-9]+$ ]] || (( reference_host_memory_kib < 8388608 )); then
-    echo "reference-host capacity evidence requires at least 8 GiB RAM; got ${reference_host_memory_kib:-unknown} KiB" >&2
-    exit 2
+    reference_host_error="reference-host capacity evidence requires at least 8 GiB RAM; got ${reference_host_memory_kib:-unknown} KiB"
+    return 1
   fi
   reference_host_validation=passed
 }
-verify_reference_host
+if ! verify_reference_host; then
+  if [[ -e $artifacts ]] && find "$artifacts" -mindepth 1 -print -quit | grep -q .; then
+    echo "reference-host preflight failed and artifact directory is non-empty; refusing to overwrite: $artifact_argument" >&2
+    exit 2
+  fi
+  mkdir -p "$artifacts"
+  preflight_file="$artifacts/reference-host-preflight.json"
+  preflight_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  jq -n \
+    --arg status "failed" \
+    --arg kind "reference_host_preflight" \
+    --arg timestamp_utc "$preflight_utc" \
+    --arg source_revision "$source_revision" \
+    --arg go_version "$go_version" \
+    --arg artifact_directory "$artifacts" \
+    --arg error "$reference_host_error" \
+    --arg gomaxprocs "$gomaxprocs" \
+    --argjson reference_host "$reference_host" \
+    --arg physical_cores "$reference_host_physical_cores" \
+    --arg memory_kib "$reference_host_memory_kib" \
+    '{schema: 1, status: $status, kind: $kind, timestamp_utc: $timestamp_utc,
+      source_revision: $source_revision, go_version: $go_version,
+      artifact_directory: $artifact_directory, campaign_created: false,
+      reference_host_required: $reference_host, gomaxprocs: $gomaxprocs,
+      physical_cores: $physical_cores, memory_kib: $memory_kib, error: $error,
+      exit_code: 2}' > "$preflight_file"
+  echo "$reference_host_error" >&2
+  echo "reference_host_preflight=$preflight_file status=failed" >&2
+  exit 2
+fi
 bin_dir="$artifacts/bin"
 raw_dir="$artifacts/raw"
 go_cache_dir="$artifacts/go-cache"
 mkdir -p "$bin_dir" "$raw_dir" "$go_cache_dir"
-if ! command -v jq >/dev/null 2>&1; then
-  echo "jq is required to create and validate the local campaign manifest" >&2
-  exit 2
-fi
-source_revision=$(git rev-parse HEAD 2>/dev/null || printf 'unknown')
 # Hash every tracked and non-ignored untracked input's current contents. A
 # git-diff hash omits untracked Go sources, which can still change the binaries
 # built below and would otherwise let a resumed campaign mix source snapshots.
@@ -167,7 +198,6 @@ source_snapshot_hash() {
   done | sha256sum | awk '{print $1}'
 }
 source_dirty_hash=$(source_snapshot_hash)
-go_version=$(go version)
 campaign_file="$artifacts/campaign.json"
 campaign_matches() {
   jq -e \
