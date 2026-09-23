@@ -129,6 +129,12 @@ fi
   echo "timestamp_utc=$run_started_utc"
   echo "gomaxprocs=$gomaxprocs"
   echo "build_flags=-trimpath"
+  # Keep copy-and-pasteable commands with the evidence rather than requiring
+  # an auditor to reconstruct them from flags and binary paths.
+  printf 'build_sgspbench_command=GOMAXPROCS=%q go build -trimpath -o %q ./cmd/sgspbench\n' \
+    "$gomaxprocs" "$bin_dir/sgspbench"
+  printf 'build_sgspbenchreport_command=GOMAXPROCS=%q go build -trimpath -o %q ./cmd/sgspbenchreport\n' \
+    "$gomaxprocs" "$bin_dir/sgspbenchreport"
   echo "go_version=$(go version)"
   echo "go_env=$(go env GOOS GOARCH GOVERSION)"
   echo "kernel=$(uname -sr)"
