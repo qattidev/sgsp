@@ -174,6 +174,9 @@ if [[ $bootstrap_client_exit == 0 ]] && rg -q 'update=.*inventory=.*stream=echo:
   bootstrap_ok=true
 fi
 
+stop_servers
+server_pids=()
+servers_stopped=true
 completed_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 evidence_status=completed
 if [[ $direct_ok != true || $bootstrap_ok != true ]]; then
@@ -208,10 +211,11 @@ jq -n \
   --argjson bootstrap_client_exit "$bootstrap_client_exit" \
   --argjson direct_ok "$direct_ok" \
   --argjson bootstrap_ok "$bootstrap_ok" \
+  --argjson servers_stopped "$servers_stopped" \
   '{schema: 1, status: $status, started_utc: $started_utc, completed_utc: $completed_utc,
     source_revision: $source_revision, fresh_checkout: $checkout,
     direct_client_exit: $direct_client_exit, bootstrap_client_exit: $bootstrap_client_exit,
-    direct_ok: $direct_ok, bootstrap_ok: $bootstrap_ok}' > "$status_file"
+    direct_ok: $direct_ok, bootstrap_ok: $bootstrap_ok, servers_stopped: $servers_stopped}' > "$status_file"
 summary_file="$artifacts/summary.md"
 {
   printf '%s\n\n' '# M7 fresh-checkout operator evidence'
@@ -219,6 +223,7 @@ summary_file="$artifacts/summary.md"
   printf '%s\n' "- source revision: $source_revision"
   printf '%s\n' "- direct client exit: $direct_client_exit; observed full exchange: $direct_ok"
   printf '%s\n' "- bootstrap client exit: $bootstrap_client_exit; observed full exchange: $bootstrap_ok"
+  printf '%s\n' "- loopback service cleanup completed: $servers_stopped"
   printf '%s\n\n' '- retained logs: `direct-server.log`, `direct-client.log`, `bootstrap-owner-a.log`, `bootstrap-owner-b.log`, `bootstrap.log`, and `bootstrap-client.log`'
   printf '%s\n' 'The clone was created from a clean committed checkout. All service addresses'
   printf '%s\n' 'are loopback-only and all output stays beneath this repository’s artifacts/.'
