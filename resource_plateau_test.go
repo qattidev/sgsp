@@ -227,9 +227,7 @@ func runSlowConsumerPlateauCycle(t *testing.T, endpoint *serverEndpoint, address
 			t.Fatalf("slow consumer retained %d active sessions", len(endpoint.Sessions()))
 		}
 	}
-	if used := endpoint.applicationBudget.Used(); used != 0 {
-		t.Fatalf("slow-consumer cleanup retained %d application bytes", used)
-	}
+	waitForResourcePlateauBudgetZero(t, ctx, endpoint)
 }
 
 func waitForResourcePlateauBudget(t *testing.T, ctx context.Context, endpoint *serverEndpoint, want int64) {
@@ -238,6 +236,17 @@ func waitForResourcePlateauBudget(t *testing.T, ctx context.Context, endpoint *s
 		select {
 		case <-ctx.Done():
 			t.Fatalf("reliable queue charge = %d, want at least %d", endpoint.applicationBudget.Used(), want)
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+func waitForResourcePlateauBudgetZero(t *testing.T, ctx context.Context, endpoint *serverEndpoint) {
+	t.Helper()
+	for endpoint.applicationBudget.Used() != 0 {
+		select {
+		case <-ctx.Done():
+			t.Fatalf("slow-consumer cleanup retained %d application bytes", endpoint.applicationBudget.Used())
 		case <-time.After(time.Millisecond):
 		}
 	}
