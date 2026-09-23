@@ -86,6 +86,11 @@ unless the machine has at least four physical CPU cores, 8 GiB RAM, and
 `SGSPBENCH_GOMAXPROCS=4`. Its environment manifest records the validated core
 and memory values. Leave this setting unset only for constrained-host harness
 diagnostics; those runs cannot establish the architecture's capacity gate.
+When this preflight rejects a new artifact destination, the runner retains a
+`reference-host-preflight.json` record there with the source revision,
+available hardware values, reason, and exit code 2, but deliberately creates
+no `campaign.json` or trial data. It refuses to add that preflight record to a
+non-empty destination, so failed host checks cannot be mixed with a campaign.
 
 For an interrupted campaign, rerun the identical command with
 `SGSPBENCH_RESUME=1`. The runner creates `campaign.json` on the first
