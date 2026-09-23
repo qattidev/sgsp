@@ -80,6 +80,12 @@ exact binaries, JSON trials, rendered summary/evaluation, and an
 `evidence.sha256` manifest for the immutable artifacts. The checksum manifest
 deliberately excludes the live `run.log` and local Go cache; verify it after a
 run with `sha256sum -c artifacts/<campaign>/evidence.sha256`.
+Each invocation additionally writes a timestamped
+`matrix-<timestamp>.status.json`. It records `completed`, `failed`, or
+`interrupted`, the phase reached, exit code, and expected/raw-trial counts.
+This makes a terminated invocation explicit even before it can render a
+summary or checksum manifest; it is a progress record and is deliberately not
+included in the final checksum manifest.
 
 For release-capacity evidence, `SGSPBENCH_REFERENCE_HOST=1` refuses to start
 unless the machine has at least four physical CPU cores, 8 GiB RAM, and
