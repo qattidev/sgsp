@@ -15,6 +15,7 @@ Environment overrides:
   SGSPBENCH_IMPAIRED_CLIENTS=16    half of a proven healthy capacity
   SGSPBENCH_GOMAXPROCS=4
   SGSPBENCH_REFERENCE_HOST=1       require the release-gate host minimums
+  SGSPBENCH_WSL_PHYSICAL_CORES=N   operator-declared physical cores for WSL2 only
   SGSPBENCH_RESUME=1               continue a matching interrupted campaign
 
 The script builds reproducible local binaries, retains the raw-vs-JSON codec
@@ -30,6 +31,11 @@ Set SGSPBENCH_REFERENCE_HOST=1 for release capacity evidence. It requires
 GOMAXPROCS=4, at least four physical CPU cores, and at least 8 GiB of RAM
 before creating a campaign. Leave it unset for constrained-host tooling
 diagnostics, which are not release capacity evidence.
+
+WSL2 exposes a synthetic CPU topology. When its topology cannot represent the
+operator-verified physical-core count, set SGSPBENCH_WSL_PHYSICAL_CORES to the
+documented value from .wslconfig. The runner accepts that declaration only in
+a detected WSL guest and retains both the synthetic topology and declaration.
 
 The script renders and retains all trial results even when a trial is invalid
 or fails, then exits nonzero if any recorded trial is non-completed.
@@ -65,6 +71,7 @@ healthy_clients=${SGSPBENCH_HEALTHY_CLIENTS:-"1 8 32 64 128"}
 impaired_clients=${SGSPBENCH_IMPAIRED_CLIENTS:-}
 gomaxprocs=${SGSPBENCH_GOMAXPROCS:-4}
 reference_host=${SGSPBENCH_REFERENCE_HOST:-0}
+wsl_physical_cores=${SGSPBENCH_WSL_PHYSICAL_CORES:-}
 resume=${SGSPBENCH_RESUME:-0}
 duration_to_ns() {
   local remaining=$1
@@ -105,6 +112,10 @@ case "$reference_host" in
 esac
 reference_host_validation=not_requested
 reference_host_physical_cores=unknown
+reference_host_detected_topology_cores=unknown
+reference_host_available_processors=unknown
+reference_host_core_source=not_requested
+reference_host_is_wsl=false
 reference_host_memory_kib=unknown
 reference_host_error=
 if ! command -v jq >/dev/null 2>&1; then
@@ -128,12 +139,32 @@ verify_reference_host() {
   if [[ $gomaxprocs != 4 ]]; then
     record_reference_host_error "reference-host capacity evidence requires SGSPBENCH_GOMAXPROCS=4; got $gomaxprocs"
   fi
+  if [[ -r /proc/sys/kernel/osrelease ]] && grep -qiE '(microsoft|wsl)' /proc/sys/kernel/osrelease; then
+    reference_host_is_wsl=true
+  fi
+  if getconf _NPROCESSORS_ONLN >/dev/null 2>&1; then
+    reference_host_available_processors=$(getconf _NPROCESSORS_ONLN)
+  elif command -v nproc >/dev/null 2>&1; then
+    reference_host_available_processors=$(nproc)
+  fi
   if command -v lscpu >/dev/null 2>&1; then
-    reference_host_physical_cores=$(lscpu -p=CORE,SOCKET | awk -F, '$1 !~ /^#/ { seen[$1 "," $2] = 1 } END { for (key in seen) { count++ } print count }')
+    reference_host_detected_topology_cores=$(lscpu -p=CORE,SOCKET | awk -F, '$1 !~ /^#/ { seen[$1 "," $2] = 1 } END { for (key in seen) { count++ } print count }')
   elif [[ $(uname -s) == Darwin ]] && command -v sysctl >/dev/null 2>&1; then
-    reference_host_physical_cores=$(sysctl -n hw.physicalcpu)
+    reference_host_detected_topology_cores=$(sysctl -n hw.physicalcpu)
   else
     record_reference_host_error "reference-host capacity evidence requires lscpu or macOS sysctl to verify physical cores"
+  fi
+  reference_host_physical_cores=$reference_host_detected_topology_cores
+  reference_host_core_source=automatic_topology
+  if [[ -n $wsl_physical_cores ]]; then
+    if [[ $reference_host_is_wsl != true ]]; then
+      record_reference_host_error "SGSPBENCH_WSL_PHYSICAL_CORES is accepted only in a detected WSL guest"
+    elif ! [[ $wsl_physical_cores =~ ^[1-9][0-9]*$ ]]; then
+      record_reference_host_error "SGSPBENCH_WSL_PHYSICAL_CORES must be a positive integer; got $wsl_physical_cores"
+    else
+      reference_host_physical_cores=$wsl_physical_cores
+      reference_host_core_source=wsl_operator_declared
+    fi
   fi
   if ! [[ $reference_host_physical_cores =~ ^[0-9]+$ ]] || (( reference_host_physical_cores < 4 )); then
     record_reference_host_error "reference-host capacity evidence requires at least four physical cores; got $reference_host_physical_cores"
@@ -175,12 +206,18 @@ if ! verify_reference_host; then
     --arg gomaxprocs "$gomaxprocs" \
     --argjson reference_host "$reference_host" \
     --arg physical_cores "$reference_host_physical_cores" \
+    --arg detected_topology_cores "$reference_host_detected_topology_cores" \
+    --arg available_processors "$reference_host_available_processors" \
+    --arg core_source "$reference_host_core_source" \
+    --argjson is_wsl "$reference_host_is_wsl" \
     --arg memory_kib "$reference_host_memory_kib" \
     '{schema: 1, status: $status, kind: $kind, timestamp_utc: $timestamp_utc,
       source_revision: $source_revision, go_version: $go_version,
       artifact_directory: $artifact_directory, campaign_created: false,
       reference_host_required: $reference_host, gomaxprocs: $gomaxprocs,
-      physical_cores: $physical_cores, memory_kib: $memory_kib, error: $error,
+      physical_cores: $physical_cores, detected_topology_cores: $detected_topology_cores,
+      available_processors: $available_processors, core_source: $core_source, is_wsl: $is_wsl,
+      memory_kib: $memory_kib, error: $error,
       exit_code: 2}' > "$preflight_file"
   echo "$reference_host_error" >&2
   echo "reference_host_preflight=$preflight_file status=failed" >&2
@@ -213,6 +250,11 @@ campaign_matches() {
     --arg impaired_clients "$impaired_clients" \
     --arg gomaxprocs "$gomaxprocs" \
     --arg reference_host "$reference_host" \
+    --arg reference_host_validation "$reference_host_validation" \
+    --arg reference_host_physical_cores "$reference_host_physical_cores" \
+    --arg reference_host_core_source "$reference_host_core_source" \
+    --arg reference_host_available_processors "$reference_host_available_processors" \
+    --arg reference_host_memory_kib "$reference_host_memory_kib" \
     --arg source_revision "$source_revision" \
     --arg source_dirty_hash "$source_dirty_hash" \
     --arg go_version "$go_version" \
@@ -223,6 +265,11 @@ campaign_matches() {
      .impaired_clients == $impaired_clients and
      .gomaxprocs == $gomaxprocs and
      .reference_host == $reference_host and
+     .reference_host_validation == $reference_host_validation and
+     .reference_host_physical_cores == $reference_host_physical_cores and
+     .reference_host_core_source == $reference_host_core_source and
+     .reference_host_available_processors == $reference_host_available_processors and
+     .reference_host_memory_kib == $reference_host_memory_kib and
      .source_revision == $source_revision and
      .source_dirty_hash == $source_dirty_hash and
      .go_version == $go_version' "$campaign_file" >/dev/null
@@ -243,12 +290,22 @@ else
     --arg impaired_clients "$impaired_clients" \
     --arg gomaxprocs "$gomaxprocs" \
     --arg reference_host "$reference_host" \
+    --arg reference_host_validation "$reference_host_validation" \
+    --arg reference_host_physical_cores "$reference_host_physical_cores" \
+    --arg reference_host_core_source "$reference_host_core_source" \
+    --arg reference_host_available_processors "$reference_host_available_processors" \
+    --arg reference_host_memory_kib "$reference_host_memory_kib" \
     --arg source_revision "$source_revision" \
     --arg source_dirty_hash "$source_dirty_hash" \
     --arg go_version "$go_version" \
     '{schema: 1, warmup: $warmup, duration: $duration,
       healthy_clients: $healthy_clients, impaired_clients: $impaired_clients,
       gomaxprocs: $gomaxprocs, reference_host: $reference_host,
+      reference_host_validation: $reference_host_validation,
+      reference_host_physical_cores: $reference_host_physical_cores,
+      reference_host_core_source: $reference_host_core_source,
+      reference_host_available_processors: $reference_host_available_processors,
+      reference_host_memory_kib: $reference_host_memory_kib,
       source_revision: $source_revision,
       source_dirty_hash: $source_dirty_hash, go_version: $go_version}' > "$campaign_file"
 fi
@@ -269,6 +326,11 @@ fi
   echo "reference_host_required=$reference_host"
   echo "reference_host_validation=$reference_host_validation"
   echo "reference_host_physical_cores=$reference_host_physical_cores"
+  echo "reference_host_detected_topology_cores=$reference_host_detected_topology_cores"
+  echo "reference_host_available_processors=$reference_host_available_processors"
+  echo "reference_host_core_source=$reference_host_core_source"
+  echo "reference_host_is_wsl=$reference_host_is_wsl"
+  echo "reference_host_wsl_declared_physical_cores=${wsl_physical_cores:-none}"
   echo "reference_host_memory_kib=$reference_host_memory_kib"
   echo "build_flags=-trimpath"
   echo "go_cache=$go_cache_dir"
