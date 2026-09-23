@@ -14,6 +14,7 @@ Environment overrides:
   SGSPBENCH_HEALTHY_CLIENTS="1 8 32 64 128"
   SGSPBENCH_IMPAIRED_CLIENTS=16    half of a proven healthy capacity
   SGSPBENCH_GOMAXPROCS=4
+  SGSPBENCH_REFERENCE_HOST=1       require the release-gate host minimums
   SGSPBENCH_RESUME=1               continue a matching interrupted campaign
 
 The script builds reproducible local binaries, runs five seeds for each
@@ -22,6 +23,11 @@ Artifacts always remain below this checkout's artifacts/ directory; /tmp is
 not a valid destination. Set SGSPBENCH_IMPAIRED_CLIENTS only after
 identifying a healthy capacity. Resume only continues a campaign whose
 configuration and source snapshot match its campaign.json manifest.
+
+Set SGSPBENCH_REFERENCE_HOST=1 for release capacity evidence. It requires
+GOMAXPROCS=4, at least four physical CPU cores, and at least 8 GiB of RAM
+before creating a campaign. Leave it unset for constrained-host tooling
+diagnostics, which are not release capacity evidence.
 
 The script renders and retains all trial results even when a trial is invalid
 or fails, then exits nonzero if any recorded trial is non-completed.
@@ -56,7 +62,57 @@ duration=${SGSPBENCH_DURATION:-60s}
 healthy_clients=${SGSPBENCH_HEALTHY_CLIENTS:-"1 8 32 64 128"}
 impaired_clients=${SGSPBENCH_IMPAIRED_CLIENTS:-}
 gomaxprocs=${SGSPBENCH_GOMAXPROCS:-4}
+reference_host=${SGSPBENCH_REFERENCE_HOST:-0}
 resume=${SGSPBENCH_RESUME:-0}
+case "$reference_host" in
+  0|1)
+    ;;
+  *)
+    echo "SGSPBENCH_REFERENCE_HOST must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
+reference_host_validation=not_requested
+reference_host_physical_cores=unknown
+reference_host_memory_kib=unknown
+verify_reference_host() {
+  if [[ $reference_host != 1 ]]; then
+    return
+  fi
+  if [[ $gomaxprocs != 4 ]]; then
+    echo "reference-host capacity evidence requires SGSPBENCH_GOMAXPROCS=4; got $gomaxprocs" >&2
+    exit 2
+  fi
+  if command -v lscpu >/dev/null 2>&1; then
+    reference_host_physical_cores=$(lscpu -p=CORE,SOCKET | awk -F, '$1 !~ /^#/ { seen[$1 "," $2] = 1 } END { for (key in seen) { count++ } print count }')
+  elif [[ $(uname -s) == Darwin ]] && command -v sysctl >/dev/null 2>&1; then
+    reference_host_physical_cores=$(sysctl -n hw.physicalcpu)
+  else
+    echo "reference-host capacity evidence requires lscpu or macOS sysctl to verify physical cores" >&2
+    exit 2
+  fi
+  if ! [[ $reference_host_physical_cores =~ ^[0-9]+$ ]] || (( reference_host_physical_cores < 4 )); then
+    echo "reference-host capacity evidence requires at least four physical cores; got $reference_host_physical_cores" >&2
+    exit 2
+  fi
+  if [[ -r /proc/meminfo ]]; then
+    reference_host_memory_kib=$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo)
+  elif [[ $(uname -s) == Darwin ]] && command -v sysctl >/dev/null 2>&1; then
+    reference_host_memory_bytes=$(sysctl -n hw.memsize)
+    if [[ $reference_host_memory_bytes =~ ^[0-9]+$ ]]; then
+      reference_host_memory_kib=$((reference_host_memory_bytes / 1024))
+    fi
+  else
+    echo "reference-host capacity evidence requires /proc/meminfo or macOS sysctl to verify RAM" >&2
+    exit 2
+  fi
+  if ! [[ $reference_host_memory_kib =~ ^[0-9]+$ ]] || (( reference_host_memory_kib < 8388608 )); then
+    echo "reference-host capacity evidence requires at least 8 GiB RAM; got ${reference_host_memory_kib:-unknown} KiB" >&2
+    exit 2
+  fi
+  reference_host_validation=passed
+}
+verify_reference_host
 bin_dir="$artifacts/bin"
 raw_dir="$artifacts/raw"
 mkdir -p "$bin_dir" "$raw_dir"
@@ -78,6 +134,7 @@ campaign_matches() {
     --arg healthy_clients "$healthy_clients" \
     --arg impaired_clients "$impaired_clients" \
     --arg gomaxprocs "$gomaxprocs" \
+    --arg reference_host "$reference_host" \
     --arg source_revision "$source_revision" \
     --arg source_dirty_hash "$source_dirty_hash" \
     --arg go_version "$go_version" \
@@ -87,6 +144,7 @@ campaign_matches() {
      .healthy_clients == $healthy_clients and
      .impaired_clients == $impaired_clients and
      .gomaxprocs == $gomaxprocs and
+     .reference_host == $reference_host and
      .source_revision == $source_revision and
      .source_dirty_hash == $source_dirty_hash and
      .go_version == $go_version' "$campaign_file" >/dev/null
@@ -106,12 +164,14 @@ else
     --arg healthy_clients "$healthy_clients" \
     --arg impaired_clients "$impaired_clients" \
     --arg gomaxprocs "$gomaxprocs" \
+    --arg reference_host "$reference_host" \
     --arg source_revision "$source_revision" \
     --arg source_dirty_hash "$source_dirty_hash" \
     --arg go_version "$go_version" \
     '{schema: 1, warmup: $warmup, duration: $duration,
       healthy_clients: $healthy_clients, impaired_clients: $impaired_clients,
-      gomaxprocs: $gomaxprocs, source_revision: $source_revision,
+      gomaxprocs: $gomaxprocs, reference_host: $reference_host,
+      source_revision: $source_revision,
       source_dirty_hash: $source_dirty_hash, go_version: $go_version}' > "$campaign_file"
 fi
 run_log="$artifacts/run.log"
@@ -128,6 +188,10 @@ fi
 {
   echo "timestamp_utc=$run_started_utc"
   echo "gomaxprocs=$gomaxprocs"
+  echo "reference_host_required=$reference_host"
+  echo "reference_host_validation=$reference_host_validation"
+  echo "reference_host_physical_cores=$reference_host_physical_cores"
+  echo "reference_host_memory_kib=$reference_host_memory_kib"
   echo "build_flags=-trimpath"
   # Keep copy-and-pasteable commands with the evidence rather than requiring
   # an auditor to reconstruct them from flags and binary paths.

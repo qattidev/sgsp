@@ -49,7 +49,7 @@ Run it on the reference host, not on a development laptop or a constrained
 CI runner:
 
 ```sh
-SGSPBENCH_GOMAXPROCS=4 \
+SGSPBENCH_GOMAXPROCS=4 SGSPBENCH_REFERENCE_HOST=1 \
   scripts/run-benchmark-matrix.sh artifacts/$(date -u +%Y%m%dT%H%M%SZ)
 ```
 
@@ -59,7 +59,8 @@ capacity is demonstrated, rerun with half that value to include the full
 impairment matrix:
 
 ```sh
-SGSPBENCH_GOMAXPROCS=4 SGSPBENCH_IMPAIRED_CLIENTS=16 \
+SGSPBENCH_GOMAXPROCS=4 SGSPBENCH_REFERENCE_HOST=1 \
+  SGSPBENCH_IMPAIRED_CLIENTS=16 \
   scripts/run-benchmark-matrix.sh artifacts/$(date -u +%Y%m%dT%H%M%SZ)
 ```
 
@@ -67,6 +68,12 @@ The matrix runner rejects `/tmp` and other destinations outside this
 checkout's `artifacts/` directory. Keep the resulting directory as the local
 machine-readable record for the run; it contains the environment manifest,
 exact binaries, JSON trials, and rendered summary.
+
+For release-capacity evidence, `SGSPBENCH_REFERENCE_HOST=1` refuses to start
+unless the machine has at least four physical CPU cores, 8 GiB RAM, and
+`SGSPBENCH_GOMAXPROCS=4`. Its environment manifest records the validated core
+and memory values. Leave this setting unset only for constrained-host harness
+diagnostics; those runs cannot establish the architecture's capacity gate.
 
 For an interrupted campaign, rerun the identical command with
 `SGSPBENCH_RESUME=1`. The runner creates `campaign.json` on the first
