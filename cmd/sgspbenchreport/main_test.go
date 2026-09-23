@@ -60,6 +60,15 @@ func TestRenderReportMarksBaselineOnlyMetricsUnavailable(t *testing.T) {
 	}
 }
 
+func TestFormatRuntimeIncludesOfferedOperationRates(t *testing.T) {
+	got := formatRuntime(runtimeMeasurement{CPUSeconds: 1.25, HeapAlloc: 50, RSSBytes: 70, TotalAlloc: 125, Mallocs: 9, OfferedOperations: 4, AllocatedBytesPerOperation: 31.25, AllocationsPerOperation: 2.25, Goroutines: 3})
+	for _, want := range []string{"offered-ops=4", "alloc/op=31.25B/2.2500"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("runtime summary missing %q: %s", want, got)
+		}
+	}
+}
+
 func TestRenderReportMarksMissedGeneratorTicksInvalid(t *testing.T) {
 	report := renderReport([]trialResult{{
 		Status: "completed",

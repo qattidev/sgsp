@@ -166,16 +166,19 @@ func (o *benchmarkObserver) Snapshot() queueMeasurement {
 }
 
 type runtimeMeasurement struct {
-	GoMaxProcs      int     `json:"gomaxprocs"`
-	Goroutines      int     `json:"goroutines"`
-	HeapAlloc       uint64  `json:"heap_alloc"`
-	RSSBytes        uint64  `json:"rss_bytes"`
-	CPUSeconds      float64 `json:"cpu_seconds"`
-	TotalAlloc      uint64  `json:"allocated_bytes"`
-	Mallocs         uint64  `json:"allocations"`
-	NumCPU          int     `json:"num_cpu"`
-	OperatingSystem string  `json:"operating_system"`
-	Architecture    string  `json:"architecture"`
+	GoMaxProcs                 int     `json:"gomaxprocs"`
+	Goroutines                 int     `json:"goroutines"`
+	HeapAlloc                  uint64  `json:"heap_alloc"`
+	RSSBytes                   uint64  `json:"rss_bytes"`
+	CPUSeconds                 float64 `json:"cpu_seconds"`
+	TotalAlloc                 uint64  `json:"allocated_bytes"`
+	Mallocs                    uint64  `json:"allocations"`
+	OfferedOperations          uint64  `json:"offered_operations"`
+	AllocatedBytesPerOperation float64 `json:"allocated_bytes_per_offered_operation"`
+	AllocationsPerOperation    float64 `json:"allocations_per_offered_operation"`
+	NumCPU                     int     `json:"num_cpu"`
+	OperatingSystem            string  `json:"operating_system"`
+	Architecture               string  `json:"architecture"`
 }
 
 // durationSummary reports upper bounds from a fixed binary histogram. Keeping
@@ -945,6 +948,7 @@ func runSGSPTrial(parent context.Context, cfg config) (result measurement, resul
 	result.Queues = observer.Snapshot()
 	result.Duration = time.Since(started)
 	result.Runtime = runtimeDelta(runtimeStarted, runtimeSnapshot())
+	result.Runtime.normalizeByOfferedOperations(result.offeredOperations())
 	for _, client := range clients {
 		stats := client.relay.Stats()
 		result.Relay.Forwarded += stats.Forwarded
@@ -1145,6 +1149,7 @@ func runQUICTrial(parent context.Context, cfg config) (result measurement, resul
 	result.Queues = queueMeasurement{AgeBuckets: map[string]uint64{}}
 	result.Duration = time.Since(started)
 	result.Runtime = runtimeDelta(runtimeStarted, runtimeSnapshot())
+	result.Runtime.normalizeByOfferedOperations(result.offeredOperations())
 	for _, client := range clients {
 		stats := client.relay.Stats()
 		result.Relay.Forwarded += stats.Forwarded
@@ -1931,6 +1936,30 @@ func runtimeDelta(start, end runtimeMeasurement) runtimeMeasurement {
 		end.CPUSeconds = 0
 	}
 	return end
+}
+
+// offeredOperations is the explicit denominator for interval allocator rates.
+// It includes every workload operation recorded at API offer time: inputs,
+// updates, requests, and paced bulk writes. The total allocation numerator
+// covers the complete same-process measurement interval, including orderly
+// finalization, so these values are campaign comparison rates rather than a
+// claim about an individual operation type's allocation internals.
+func (m measurement) offeredOperations() uint64 {
+	return m.Inputs.Offered + m.Updates.Offered + m.Requests.Offered + m.Bulk.Offered
+}
+
+func (r *runtimeMeasurement) normalizeByOfferedOperations(operations uint64) {
+	if r == nil {
+		return
+	}
+	r.OfferedOperations = operations
+	r.AllocatedBytesPerOperation = 0
+	r.AllocationsPerOperation = 0
+	if operations == 0 {
+		return
+	}
+	r.AllocatedBytesPerOperation = float64(r.TotalAlloc) / float64(operations)
+	r.AllocationsPerOperation = float64(r.Mallocs) / float64(operations)
 }
 
 // processRSSBytes records Linux resident memory when it is available. A zero

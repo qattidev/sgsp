@@ -125,12 +125,15 @@ type queueMeasurement struct {
 }
 
 type runtimeMeasurement struct {
-	Goroutines int     `json:"goroutines"`
-	HeapAlloc  uint64  `json:"heap_alloc"`
-	RSSBytes   uint64  `json:"rss_bytes"`
-	CPUSeconds float64 `json:"cpu_seconds"`
-	TotalAlloc uint64  `json:"allocated_bytes"`
-	Mallocs    uint64  `json:"allocations"`
+	Goroutines                 int     `json:"goroutines"`
+	HeapAlloc                  uint64  `json:"heap_alloc"`
+	RSSBytes                   uint64  `json:"rss_bytes"`
+	CPUSeconds                 float64 `json:"cpu_seconds"`
+	TotalAlloc                 uint64  `json:"allocated_bytes"`
+	Mallocs                    uint64  `json:"allocations"`
+	OfferedOperations          uint64  `json:"offered_operations"`
+	AllocatedBytesPerOperation float64 `json:"allocated_bytes_per_offered_operation"`
+	AllocationsPerOperation    float64 `json:"allocations_per_offered_operation"`
 }
 
 type trialResult struct {
@@ -346,7 +349,10 @@ func formatRuntime(runtime runtimeMeasurement) string {
 	if runtime.Goroutines == 0 && runtime.HeapAlloc == 0 && runtime.RSSBytes == 0 && runtime.CPUSeconds == 0 && runtime.TotalAlloc == 0 && runtime.Mallocs == 0 {
 		return "-"
 	}
-	return fmt.Sprintf("cpu=%.3fs; heap=%dB; rss=%dB; alloc=%dB/%d; goroutines=%d", runtime.CPUSeconds, runtime.HeapAlloc, runtime.RSSBytes, runtime.TotalAlloc, runtime.Mallocs, runtime.Goroutines)
+	if runtime.OfferedOperations == 0 {
+		return fmt.Sprintf("cpu=%.3fs; heap=%dB; rss=%dB; alloc=%dB/%d; offered-ops=n/a; goroutines=%d", runtime.CPUSeconds, runtime.HeapAlloc, runtime.RSSBytes, runtime.TotalAlloc, runtime.Mallocs, runtime.Goroutines)
+	}
+	return fmt.Sprintf("cpu=%.3fs; heap=%dB; rss=%dB; alloc=%dB/%d; offered-ops=%d; alloc/op=%.2fB/%.4f; goroutines=%d", runtime.CPUSeconds, runtime.HeapAlloc, runtime.RSSBytes, runtime.TotalAlloc, runtime.Mallocs, runtime.OfferedOperations, runtime.AllocatedBytesPerOperation, runtime.AllocationsPerOperation, runtime.Goroutines)
 }
 
 func sanitizeCell(value string) string {

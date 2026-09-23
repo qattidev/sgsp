@@ -302,4 +302,12 @@ func TestRuntimeDeltaUsesIntervalAllocationCounters(t *testing.T) {
 	if got.HeapAlloc != 50 || got.RSSBytes != 70 || got.CPUSeconds != 0.75 || got.TotalAlloc != 25 || got.Mallocs != 9 {
 		t.Fatalf("runtime delta = %#v", got)
 	}
+	got.normalizeByOfferedOperations(4)
+	if got.OfferedOperations != 4 || got.AllocatedBytesPerOperation != 6.25 || got.AllocationsPerOperation != 2.25 {
+		t.Fatalf("normalized runtime delta = %#v", got)
+	}
+	got.normalizeByOfferedOperations(0)
+	if got.OfferedOperations != 0 || got.AllocatedBytesPerOperation != 0 || got.AllocationsPerOperation != 0 {
+		t.Fatalf("zero-operation normalization changed rates = %#v", got)
+	}
 }
