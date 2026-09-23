@@ -113,25 +113,30 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 source_revision=$(git rev-parse HEAD 2>/dev/null || printf 'unknown')
 go_version=$(go version)
+record_reference_host_error() {
+  local message=$1
+  if [[ -n $reference_host_error ]]; then
+    reference_host_error+="; $message"
+  else
+    reference_host_error=$message
+  fi
+}
 verify_reference_host() {
   if [[ $reference_host != 1 ]]; then
     return
   fi
   if [[ $gomaxprocs != 4 ]]; then
-    reference_host_error="reference-host capacity evidence requires SGSPBENCH_GOMAXPROCS=4; got $gomaxprocs"
-    return 1
+    record_reference_host_error "reference-host capacity evidence requires SGSPBENCH_GOMAXPROCS=4; got $gomaxprocs"
   fi
   if command -v lscpu >/dev/null 2>&1; then
     reference_host_physical_cores=$(lscpu -p=CORE,SOCKET | awk -F, '$1 !~ /^#/ { seen[$1 "," $2] = 1 } END { for (key in seen) { count++ } print count }')
   elif [[ $(uname -s) == Darwin ]] && command -v sysctl >/dev/null 2>&1; then
     reference_host_physical_cores=$(sysctl -n hw.physicalcpu)
   else
-    reference_host_error="reference-host capacity evidence requires lscpu or macOS sysctl to verify physical cores"
-    return 1
+    record_reference_host_error "reference-host capacity evidence requires lscpu or macOS sysctl to verify physical cores"
   fi
   if ! [[ $reference_host_physical_cores =~ ^[0-9]+$ ]] || (( reference_host_physical_cores < 4 )); then
-    reference_host_error="reference-host capacity evidence requires at least four physical cores; got $reference_host_physical_cores"
-    return 1
+    record_reference_host_error "reference-host capacity evidence requires at least four physical cores; got $reference_host_physical_cores"
   fi
   if [[ -r /proc/meminfo ]]; then
     reference_host_memory_kib=$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo)
@@ -141,11 +146,12 @@ verify_reference_host() {
       reference_host_memory_kib=$((reference_host_memory_bytes / 1024))
     fi
   else
-    reference_host_error="reference-host capacity evidence requires /proc/meminfo or macOS sysctl to verify RAM"
-    return 1
+    record_reference_host_error "reference-host capacity evidence requires /proc/meminfo or macOS sysctl to verify RAM"
   fi
   if ! [[ $reference_host_memory_kib =~ ^[0-9]+$ ]] || (( reference_host_memory_kib < 8388608 )); then
-    reference_host_error="reference-host capacity evidence requires at least 8 GiB RAM; got ${reference_host_memory_kib:-unknown} KiB"
+    record_reference_host_error "reference-host capacity evidence requires at least 8 GiB RAM; got ${reference_host_memory_kib:-unknown} KiB"
+  fi
+  if [[ -n $reference_host_error ]]; then
     return 1
   fi
   reference_host_validation=passed
