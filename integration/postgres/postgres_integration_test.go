@@ -36,10 +36,11 @@ func integrationDB(t *testing.T) *sql.DB {
 		t.Fatal(err)
 	}
 	schema := "sgsp_it_" + hex.EncodeToString(suffix)
-	admin, err := sql.Open("pgx", url)
+	adminConfig, err := pgx.ParseConfig(url)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal("SGSP_TEST_DATABASE_URL is invalid")
 	}
+	admin := stdlib.OpenDB(*adminConfig)
 	if _, err := admin.Exec(`CREATE SCHEMA ` + quoteIdentifier(schema)); err != nil {
 		_ = admin.Close()
 		t.Fatal(err)
@@ -54,7 +55,7 @@ func integrationDB(t *testing.T) *sql.DB {
 	})
 	config, err := pgx.ParseConfig(url)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal("SGSP_TEST_DATABASE_URL is invalid")
 	}
 	if config.RuntimeParams == nil {
 		config.RuntimeParams = make(map[string]string)
