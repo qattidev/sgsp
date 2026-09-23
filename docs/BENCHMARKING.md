@@ -2,7 +2,13 @@
 
 `scripts/run-benchmark-matrix.sh` runs the section-12 SGSP and bare-QUIC
 matrix using separately built binaries. It writes one JSON result per trial,
-an `environment.txt` manifest, and a generated `summary.md` index.
+an `environment.txt` manifest, a generated `summary.md` index, and an
+`evaluation.md` matrix assessment. The assessment cross-checks every raw trial
+against `expected-trials.tsv`, identifies the highest healthy SGSP point that
+meets the benchmark-local gates, checks the full half-capacity impairment
+matrix, and presents SGSP-versus-bare-QUIC comparisons. It labels absent or
+failed evidence `INCOMPLETE`/`FAILED`; it never turns a diagnostic run into an
+M8 release pass.
 
 Each trial also records fixed-memory binary-histogram timing summaries. They
 include input and update API-to-adapter handoff durations, plus decoded-frame
@@ -70,7 +76,10 @@ SGSPBENCH_GOMAXPROCS=4 SGSPBENCH_REFERENCE_HOST=1 \
 The matrix runner rejects `/tmp` and other destinations outside this
 checkout's `artifacts/` directory. Keep the resulting directory as the local
 machine-readable record for the run; it contains the environment manifest,
-exact binaries, JSON trials, and rendered summary.
+exact binaries, JSON trials, rendered summary/evaluation, and an
+`evidence.sha256` manifest for the immutable artifacts. The checksum manifest
+deliberately excludes the live `run.log` and local Go cache; verify it after a
+run with `sha256sum -c artifacts/<campaign>/evidence.sha256`.
 
 For release-capacity evidence, `SGSPBENCH_REFERENCE_HOST=1` refuses to start
 unless the machine has at least four physical CPU cores, 8 GiB RAM, and
@@ -107,7 +116,9 @@ log, status, and summary locally below `artifacts/`. This is functional
 reconnect/protocol evidence, not a substitute for the five-seed capacity
 matrix.
 
-The generated report is a trial index, not a gate verdict. Its results must be
-evaluated against the p99 local-overhead, drop, plateau, reconnect, and
-capacity criteria in [ARCHITECTURE.md](../ARCHITECTURE.md). A short run may be
-used to test the tooling, but never reported as a 60-second matrix result.
+`summary.md` remains a trial index. `evaluation.md` is its auditable matrix
+interpretation, but it deliberately excludes the separately retained plateau
+and functional evidence. Evaluate all of those artifacts against the p99
+local-overhead, drop, plateau, reconnect, and capacity criteria in
+[ARCHITECTURE.md](../ARCHITECTURE.md). A short run may be used to test the
+tooling, but never reported as a 60-second matrix result.
