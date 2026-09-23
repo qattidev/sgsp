@@ -110,72 +110,34 @@ reported as passed:
   1,000-cycle shutdown-cleanup test (request, loss, explicit resume, close,
   no retained session/application budget, and post-GC heap tolerance) are
   present;
-- the M8 impairment matrix and published performance trial results.
-  `cmd/sgspbench` now runs a bounded single SGSP or bare-QUIC trial through
-  per-client deterministic two-socket UDP relays, exercising sequenced
-  input/update datagrams, request/reply, and paced raw-stream bulk data. Its
-  JSON uses bounded fixed-memory histograms for input/update API-to-adapter
-  handoff, decoded-frame-to-handler/poll-return receive overhead, successful
-  request round trip, and same-process update age. Fixed per-client sequence
-  buffers correlate both directional local budgets (client input send plus
-  server input receive, and server update send plus client update receive),
-  publish unmatched fractions, and invalidate a trial if either buffer
-  overflows. Results also separate transport RTT, local/coalesced/stale SGSP
-  drops, explicit unknown request outcomes, relay loss, and peak relay
-  backlog, plus queue occupancy maxima and bounded queue-age buckets;
-  the bare-QUIC baseline explicitly marks SGSP-only local-drop and dispatch
-  queue measurements unavailable instead of treating them as zero, while it
-  classifies post-write request failures as outcome-unknown;
-  percentile fields are upper bounds rather than retained per-operation
-  samples.
-  `scripts/run-benchmark-matrix.sh` builds both binaries, captures environment
-  metadata, runs the configured five-seed matrix, and invokes
-  `cmd/sgspbenchreport` to index the JSON results. A 100 ms, one-client,
-  five-seed tooling smoke passed locally. On 2026-09-16, a second 50 ms,
-  one-client script smoke completed all 20 trials (both implementations,
-  60/128 Hz, five seeds) and rendered timing, relay, runtime, and build-flag
-  metadata into temporary local artifacts. A paired full 60-second pilot
-  (one client, 60 Hz, 20 ms RTT, seed 1, `GOMAXPROCS=1`) completed for both
-  implementations with no failed operations, relay drops, or relay overload:
-  SGSP accepted 3,601 inputs and delivered 3,600, accepted/delivered 3,600
-  updates, delivered 120 requests, and delivered 3,774,874 bulk bytes; bare
-  QUIC accepted/delivered 3,600 inputs and updates, delivered 120 requests,
-  and delivered 3,774,874 bulk bytes. Offered-but-unmatched work at the
-  measurement cutoff is deliberately not counted as a failure. These are
-  local pilot artifacts only, not a published result. They cannot establish
-  capacity or variance, so the required five-seed 60-second matrix, plateau
-  campaign, and published report remain incomplete. A subsequent full
-  one-client healthy sweep (both implementations, 60/128 Hz, five seeds,
-  10-second warmup and 60-second measurement, `GOMAXPROCS=4`) completed all
-  20 of 20 recorded trials. It establishes only the configured one-client
-  sweep. The corresponding eight-client healthy sweep also completed all
-  20 of 20 trials under the same timing, rate, seed, and implementation
-  matrix, as did the 32-, 64-, and 128-client healthy sweeps. The original
-  serial high-client setup incorrectly charged connection establishment to
-  the measurement deadline and retained the normal per-IP admission rate;
-  `sgspbench` now scales those bounded loopback admission limits and
-  establishes benchmark clients concurrently before warmup. A corrected
-  256-client sweep also completed all 20 trials. At 64 clients and 128 Hz,
-  all five SGSP trials accepted and delivered nearly all generated workload
-  without relay overload. At 128 and 256 clients, 128 Hz SGSP update delivery
-  fell materially below the generated input volume, so 64 is the locally
-  observed healthy point and 32 is the selected impairment population. This
-  does not pass M8: the full impairment matrix, complete performance report,
-  and remaining release evidence are still incomplete.
+- M8 capacity, impairment, plateau, and published comparison evidence. The
+  benchmark harness now runs SGSP and bare-QUIC trials through deterministic
+  per-client two-socket UDP relays with bounded timing histograms, correlated
+  directional local budgets, queue/drop and relay-backlog observations, and
+  explicit known versus unknown request failures. Bare-QUIC correctly renders
+  SGSP-only queue/drop measures unavailable. The runner accepts only local
+  `artifacts/` paths, preserving its exact binaries, manifests, raw JSON, and
+  report; benchmark matrices are never retained under `/tmp`.
 
-Historical `/tmp` benchmark outputs are not retained evidence. The matrix
-runner now accepts only canonical paths below this checkout's `artifacts/`
-directory, retaining the built binaries, environment manifest, raw JSON, run
-log, campaign manifest, and rendered summary for every future campaign. The
-short 20-trial directional-overhead tooling smoke at
-`artifacts/directional-overhead-smoke-20260922/` confirms that this local
-record includes both paired directional distributions. Its 20/75 ms trial
-settings make it tooling evidence only, not a performance result.
-The subsequent 20-trial, one-client 50 ms warmup / 1.1 s measurement smoke at
-`artifacts/measurement-availability-smoke-20260922/` completed every trial
-and confirms that SGSP JSON records queue/local-drop availability while the
-bare-QUIC records render those library-only metrics as unavailable. It is
-also tooling evidence only, not a capacity result.
+Warmup and measurement are separate workload generations. Phase-marked
+datagrams, requests, and bulk streams prevent late warmup work from appearing
+in measured offered, accepted, or delivered counts. The benchmark also records
+scheduled and missed input/request/bulk ticks, marking a trial invalid when
+the generator cannot sustain its configured schedule.
+
+The retained `artifacts/healthy-1c-full-20260922/` matrix predates this
+phase-aware accounting and is diagnostic only, not capacity evidence. It also
+records 11--22 local/coalesced SGSP datagram drops at 128 Hz (about
+0.15--0.29%), above the architecture's below-0.1% criterion. The retained
+boundary-validation matrices
+`artifacts/measurement-boundary-smoke-20260922/` and
+`artifacts/measurement-boundary-readiness-smoke-20260922/` have no
+offered/accepted/delivered boundary inversion; the latter correctly invalidates
+all 20 short trials on this constrained host because scheduled input and/or
+bulk ticks were missed. These are harness diagnostics, not performance
+results. The five-seed 60-second capacity and plateau campaign, full
+impairment matrix at half that capacity, and published comparison remain
+incomplete.
 
 `TestReconnectBlackholeDurations` now performs the required real UDP-relay
 blackholes for 2, 8, and 40 seconds. The locally retained JSON record at
