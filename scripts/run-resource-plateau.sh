@@ -8,6 +8,7 @@ Usage: scripts/run-resource-plateau.sh [artifacts/subdirectory]
 
 Environment overrides:
   SGSP_RESOURCE_PLATEAU_DURATION=10m
+  SGSP_RESOURCE_PLATEAU_TEST_TIMEOUT=12m
 
 The default run drives real QUIC slow-consumer closures for ten minutes. It
 retains a campaign manifest, local Go cache, environment manifest, Go test
@@ -44,6 +45,7 @@ case "$artifacts" in
 esac
 
 duration=${SGSP_RESOURCE_PLATEAU_DURATION:-10m}
+test_timeout=${SGSP_RESOURCE_PLATEAU_TEST_TIMEOUT:-12m}
 if ! command -v jq >/dev/null 2>&1; then
   echo "jq is required to create and validate local plateau evidence" >&2
   exit 2
@@ -63,10 +65,11 @@ fi
 mkdir -p "$artifacts/go-cache"
 jq -n \
   --arg duration "$duration" \
+  --arg test_timeout "$test_timeout" \
   --arg source_revision "$source_revision" \
   --arg source_dirty_hash "$source_dirty_hash" \
   --arg go_version "$go_version" \
-  '{schema: 1, duration: $duration, source_revision: $source_revision,
+  '{schema: 1, duration: $duration, test_timeout: $test_timeout, source_revision: $source_revision,
     source_dirty_hash: $source_dirty_hash, go_version: $go_version}' > "$campaign_file"
 
 run_log="$artifacts/run.log"
@@ -79,6 +82,7 @@ environment_file="$artifacts/environment.txt"
 {
   echo "timestamp_utc=$run_started_utc"
   echo "requested_duration=$duration"
+  echo "test_timeout=$test_timeout"
   echo "go_version=$go_version"
   echo "go_env=$(go env GOOS GOARCH GOVERSION)"
   echo "kernel=$(uname -sr)"
@@ -93,12 +97,12 @@ echo "resource_plateau_environment=$environment_file"
 
 result_file="$artifacts/result.json"
 test_log="$artifacts/test.log"
-printf 'resource_plateau_command=GOCACHE=%q SGSP_RESOURCE_PLATEAU_DURATION=%q SGSP_RESOURCE_PLATEAU_OUTPUT=%q go test -count=1 -run %q .\n' \
-  "$artifacts/go-cache" "$duration" "$result_file" '^TestResourcePlateau$' | tee -a "$test_log"
+printf 'resource_plateau_command=GOCACHE=%q SGSP_RESOURCE_PLATEAU_DURATION=%q SGSP_RESOURCE_PLATEAU_OUTPUT=%q go test -count=1 -timeout=%q -run %q .\n' \
+  "$artifacts/go-cache" "$duration" "$result_file" "$test_timeout" '^TestResourcePlateau$' | tee -a "$test_log"
 set +e
 GOCACHE="$artifacts/go-cache" SGSP_RESOURCE_PLATEAU_DURATION="$duration" \
   SGSP_RESOURCE_PLATEAU_OUTPUT="$result_file" \
-  go test -count=1 -run '^TestResourcePlateau$' . 2>&1 | tee -a "$test_log"
+  go test -count=1 -timeout="$test_timeout" -run '^TestResourcePlateau$' . 2>&1 | tee -a "$test_log"
 test_status=${PIPESTATUS[0]}
 set -e
 
@@ -113,12 +117,13 @@ status_file="$artifacts/status.json"
 jq -n \
   --arg status "$status" \
   --arg duration "$duration" \
+  --arg test_timeout "$test_timeout" \
   --arg started_utc "$run_started_utc" \
   --arg completed_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --arg result "$result_file" \
   --arg log "$test_log" \
   --argjson exit_code "$test_status" \
-  '{schema: 1, status: $status, requested_duration: $duration,
+  '{schema: 1, status: $status, requested_duration: $duration, test_timeout: $test_timeout,
     started_utc: $started_utc, completed_utc: $completed_utc,
     exit_code: $exit_code, result: $result, log: $log}' > "$status_file"
 summary_file="$artifacts/summary.md"
@@ -126,6 +131,7 @@ summary_file="$artifacts/summary.md"
   echo '# Slow-consumer resource plateau'
   echo
   echo "- Requested duration: $duration"
+  echo "- Go test timeout: $test_timeout"
   echo "- Campaign manifest: \`campaign.json\`"
   echo "- Environment: \`environment.txt\`"
   echo "- Test log: \`test.log\`"
