@@ -35,7 +35,10 @@ offered rate. On Linux CPU time is user plus system process time; on other
 platforms a zero value means that this dependency-free collector is
 unavailable.
 
-Run the separate codec microbenchmark independently of transport trials:
+The matrix runner also executes and retains the codec microbenchmark alongside
+its transport trials, in `codec-benchmark-*.txt` and
+`codec-benchmark-*.status.json` under the campaign directory. Run it by itself
+only when iterating on codecs:
 
 ```sh
 go test -run '^$' -bench '^BenchmarkCodec' -benchmem .
@@ -90,18 +93,19 @@ successful.
 The reconnect cases are a separate real-QUIC regression test, rather than
 synthetic benchmark samples. It blackholes both directions of an established
 UDP relay for 2, 8, and 40 seconds, verifies continuity, resume within grace,
-and expiry beyond transport idle detection plus grace, and logs the observed
-recovery or expiry timing. Preserve its JSON output locally as well:
+and expiry beyond transport idle detection plus grace. Pair it with the
+race-tested ordering, epoch, and loss invariants through the retained M8
+functional-evidence runner:
 
 ```sh
-run_dir=artifacts/reconnect-$(date -u +%Y%m%dT%H%M%SZ)
-mkdir -p "$run_dir"
-go test -json -count=1 -run '^TestReconnectBlackholeDurations$' . \
-  > "$run_dir/test.json"
+scripts/run-m8-functional-evidence.sh \
+  artifacts/m8-functional-$(date -u +%Y%m%dT%H%M%SZ)
 ```
 
-This is functional reconnect evidence, not a substitute for the five-seed
-capacity matrix.
+It preserves a source manifest, environment, raw Go JSON event streams, run
+log, status, and summary locally below `artifacts/`. This is functional
+reconnect/protocol evidence, not a substitute for the five-seed capacity
+matrix.
 
 The generated report is a trial index, not a gate verdict. Its results must be
 evaluated against the p99 local-overhead, drop, plateau, reconnect, and
