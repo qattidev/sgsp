@@ -23,7 +23,8 @@ JSON under raw/, and writes summary.md. Artifacts always remain below this
 checkout's artifacts/ directory; /tmp is not a valid destination. Set
 SGSPBENCH_IMPAIRED_CLIENTS only after identifying a healthy capacity. Resume
 only continues a campaign whose configuration and source snapshot match its
-campaign.json manifest.
+campaign.json manifest. SGSPBENCH_DURATION must use whole ns, us, ms, s, m,
+or h units so every retained trial can be matched exactly to its plan.
 
 Set SGSPBENCH_REFERENCE_HOST=1 for release capacity evidence. It requires
 GOMAXPROCS=4, at least four physical CPU cores, and at least 8 GiB of RAM
@@ -65,6 +66,35 @@ impaired_clients=${SGSPBENCH_IMPAIRED_CLIENTS:-}
 gomaxprocs=${SGSPBENCH_GOMAXPROCS:-4}
 reference_host=${SGSPBENCH_REFERENCE_HOST:-0}
 resume=${SGSPBENCH_RESUME:-0}
+duration_to_ns() {
+  local remaining=$1
+  local value
+  local unit
+  local multiplier
+  local total=0
+  while [[ -n $remaining ]]; do
+    if ! [[ $remaining =~ ^([0-9]+)(ns|us|µs|ms|s|m|h)(.*)$ ]]; then
+      return 1
+    fi
+    value=${BASH_REMATCH[1]}
+    unit=${BASH_REMATCH[2]}
+    remaining=${BASH_REMATCH[3]}
+    case "$unit" in
+      ns) multiplier=1 ;;
+      us|µs) multiplier=1000 ;;
+      ms) multiplier=1000000 ;;
+      s) multiplier=1000000000 ;;
+      m) multiplier=60000000000 ;;
+      h) multiplier=3600000000000 ;;
+    esac
+    total=$((total + value * multiplier))
+  done
+  printf '%s\n' "$total"
+}
+if ! duration_ns=$(duration_to_ns "$duration") || (( duration_ns <= 0 )); then
+  echo "SGSPBENCH_DURATION must be a positive duration using whole ns, us, ms, s, m, or h units" >&2
+  exit 2
+fi
 case "$reference_host" in
   0|1)
     ;;
@@ -259,23 +289,34 @@ expected_trials_file="$artifacts/expected-trials.tsv"
 
 run_trial() {
   local implementation=$1 clients=$2 hz=$3 rtt=$4 loss=$5 jitter=$6 reorder=$7 seed=$8 profile=$9
+  local rtt_ns jitter_ns
+  if ! rtt_ns=$(duration_to_ns "$rtt") || ! jitter_ns=$(duration_to_ns "$jitter"); then
+    echo "internal matrix duration is not representable in nanoseconds: rtt=$rtt jitter=$jitter" >&2
+    exit 2
+  fi
   local file="$raw_dir/${profile}-${implementation}-c${clients}-hz${hz}-rtt${rtt}-loss${loss}-j${jitter}-r${reorder}-seed${seed}.json"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$implementation" "$clients" "$hz" "$rtt" "$loss" "$jitter" "$reorder" "$seed" "$profile" "$file" >> "$expected_trials_file"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$implementation" "$clients" "$hz" "$rtt" "$rtt_ns" "$loss" "$jitter" "$jitter_ns" "$reorder" "$seed" "$profile" "$duration_ns" "$file" >> "$expected_trials_file"
   if [[ $resume == 1 ]] && jq -e \
     --arg implementation "$implementation" \
     --argjson clients "$clients" \
     --argjson hz "$hz" \
+    --argjson rtt "$rtt_ns" \
     --argjson loss "$loss" \
+    --argjson jitter "$jitter_ns" \
     --argjson reorder "$reorder" \
     --argjson seed "$seed" \
+    --argjson duration "$duration_ns" \
     '.status == "completed" and
      .config.implementation == $implementation and
      .config.clients == $clients and
      .config.hz == $hz and
+     .config.rtt == $rtt and
      .config.loss == $loss and
+     .config.jitter == $jitter and
      .config.reorder == $reorder and
-     .config.seed == $seed' "$file" >/dev/null 2>&1; then
+     .config.seed == $seed and
+     .config.duration == $duration' "$file" >/dev/null 2>&1; then
     echo "resume_skip=$file"
     return
   fi
@@ -326,7 +367,7 @@ fi
 
 matrix_coverage_failures=0
 expected_trials=0
-while IFS=$'\t' read -r implementation clients hz rtt loss jitter reorder seed profile file; do
+while IFS=$'\t' read -r implementation clients hz rtt rtt_ns loss jitter jitter_ns reorder seed profile duration_ns file; do
   expected_trials=$((expected_trials + 1))
   if [[ ! -s $file ]]; then
     matrix_coverage_failures=$((matrix_coverage_failures + 1))
@@ -337,16 +378,22 @@ while IFS=$'\t' read -r implementation clients hz rtt loss jitter reorder seed p
     --arg implementation "$implementation" \
     --argjson clients "$clients" \
     --argjson hz "$hz" \
+    --argjson rtt "$rtt_ns" \
     --argjson loss "$loss" \
+    --argjson jitter "$jitter_ns" \
     --argjson reorder "$reorder" \
     --argjson seed "$seed" \
+    --argjson duration "$duration_ns" \
     '.status == "completed" and
      .config.implementation == $implementation and
      .config.clients == $clients and
      .config.hz == $hz and
+     .config.rtt == $rtt and
      .config.loss == $loss and
+     .config.jitter == $jitter and
      .config.reorder == $reorder and
-     .config.seed == $seed' "$file" >/dev/null; then
+     .config.seed == $seed and
+     .config.duration == $duration' "$file" >/dev/null; then
     matrix_coverage_failures=$((matrix_coverage_failures + 1))
     echo "matrix_incomplete_or_mismatched_trial=$file" >&2
   fi
