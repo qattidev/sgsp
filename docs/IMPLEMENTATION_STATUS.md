@@ -82,15 +82,15 @@ server-facing source port. It observes the QUIC probe, `PATH_CHALLENGE`, and
 that traffic continues with the original SGSP session epoch. This records
 same-epoch NAT-rebinding support for the pinned QUIC adapter.
 
-M3 and M5 implementation coverage is present and documented in the
+M3 through M5 implementation coverage is present and documented in the
 corresponding milestone records. It includes bounded reliable event/request
 body admission and directional `QueueBytes` accounting, `Call` response
-reservation, bounded control writes, slow-consumer closure, barrier-driven
-100-candidate resume races, credential-bound resumes, old-epoch reply/stream
-fencing, request/custom-stream loss cleanup, no-replay unknown outcomes,
-expired-ID retention, and the 1,000-cycle real-QUIC shutdown cleanup test.
-Those are implementation regression gates, not a replacement for M8 release
-evidence.
+reservation, bounded control writes, slow-consumer closure, authentication,
+refresh/revocation/admission binding, barrier-driven 100-candidate resume
+races, credential-bound resumes, old-epoch reply/stream fencing,
+request/custom-stream loss cleanup, no-replay unknown outcomes, expired-ID
+retention, and the 1,000-cycle real-QUIC shutdown cleanup test. Those are
+implementation regression gates, not a replacement for M8 release evidence.
 
 The following gates are still incomplete and must not be reported as passed:
 
