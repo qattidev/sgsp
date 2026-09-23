@@ -242,6 +242,8 @@ fi
     "$gomaxprocs" "$bin_dir/sgspbench"
   printf 'build_sgspbenchreport_command=GOMAXPROCS=%q go build -trimpath -o %q ./cmd/sgspbenchreport\n' \
     "$gomaxprocs" "$bin_dir/sgspbenchreport"
+  printf 'build_sgspbencheval_command=GOMAXPROCS=%q go build -trimpath -o %q ./cmd/sgspbencheval\n' \
+    "$gomaxprocs" "$bin_dir/sgspbencheval"
   echo "go_version=$(go version)"
   echo "go_env=$(go env GOOS GOARCH GOVERSION)"
   echo "kernel=$(uname -sr)"
@@ -258,6 +260,7 @@ echo "environment_manifest=$environment_file"
 
 GOCACHE="$go_cache_dir" GOMAXPROCS="$gomaxprocs" go build -trimpath -o "$bin_dir/sgspbench" ./cmd/sgspbench
 GOCACHE="$go_cache_dir" GOMAXPROCS="$gomaxprocs" go build -trimpath -o "$bin_dir/sgspbenchreport" ./cmd/sgspbenchreport
+GOCACHE="$go_cache_dir" GOMAXPROCS="$gomaxprocs" go build -trimpath -o "$bin_dir/sgspbencheval" ./cmd/sgspbencheval
 codec_log="$artifacts/codec-benchmark-$run_stamp.txt"
 codec_status_file="$artifacts/codec-benchmark-$run_stamp.status.json"
 codec_started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -407,6 +410,27 @@ echo "matrix_coverage_failures=$matrix_coverage_failures"
 
 summary_file="$artifacts/summary.md"
 "$bin_dir/sgspbenchreport" --input "$raw_dir" --output "$summary_file"
+evaluation_file="$artifacts/evaluation.md"
+evaluation_status_file="$artifacts/evaluation-$run_stamp.status.json"
+evaluation_started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+set +e
+"$bin_dir/sgspbencheval" --input "$artifacts"
+evaluation_exit_code=$?
+set -e
+evaluation_completed_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+evaluation_status=completed
+if [[ $evaluation_exit_code -ne 0 ]]; then
+  evaluation_status=failed
+fi
+jq -n \
+  --arg status "$evaluation_status" \
+  --arg started_utc "$evaluation_started_utc" \
+  --arg completed_utc "$evaluation_completed_utc" \
+  --arg output "$evaluation_file" \
+  --arg command "sgspbencheval --input $artifacts" \
+  --argjson exit_code "$evaluation_exit_code" \
+  '{schema: 1, status: $status, started_utc: $started_utc, completed_utc: $completed_utc,
+    output: $output, command: $command, exit_code: $exit_code}' > "$evaluation_status_file"
 {
   echo
   echo '## Campaign context'
@@ -417,6 +441,8 @@ summary_file="$artifacts/summary.md"
   echo '- Expected trial plan: `expected-trials.tsv`'
   echo "- Codec microbenchmark log: \`$(basename "$codec_log")\`"
   echo "- Codec microbenchmark status: \`$(basename "$codec_status_file")\` ($codec_status)"
+  echo "- Matrix evaluation: \`$(basename "$evaluation_file")\`"
+  echo "- Matrix evaluation status: \`$(basename "$evaluation_status_file")\` ($evaluation_status)"
   echo "- Source revision: \`$source_revision\`"
   echo "- Source snapshot hash: \`$source_dirty_hash\`"
   echo "- Reference-host validation: \`$reference_host_validation\`"
@@ -425,7 +451,7 @@ summary_file="$artifacts/summary.md"
   echo "- Invocation non-completed trials: $non_completed_trials"
 } >> "$summary_file"
 echo "Artifacts written to $artifacts" >&2
-if (( non_completed_trials > 0 || matrix_coverage_failures > 0 || codec_exit_code > 0 )); then
-  echo "matrix_non_completed_trials=$non_completed_trials matrix_coverage_failures=$matrix_coverage_failures codec_exit_code=$codec_exit_code" >&2
+if (( non_completed_trials > 0 || matrix_coverage_failures > 0 || codec_exit_code > 0 || evaluation_exit_code > 0 )); then
+  echo "matrix_non_completed_trials=$non_completed_trials matrix_coverage_failures=$matrix_coverage_failures codec_exit_code=$codec_exit_code evaluation_exit_code=$evaluation_exit_code" >&2
   exit 1
 fi
