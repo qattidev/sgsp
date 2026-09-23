@@ -156,6 +156,31 @@ func TestAssignmentVersionAndClose(t *testing.T) {
 	}
 }
 
+func TestMigrationReapplicationAndDrift(t *testing.T) {
+	db := integrationDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	// integrationDB already proves that applying the embedded migrations twice
+	// is a no-op. Mutate only this disposable schema's recorded checksum to
+	// prove the runner rejects source/history drift instead of guessing a repair.
+	result, err := db.ExecContext(ctx,
+		`UPDATE sgsp_schema_migrations SET checksum=$1 WHERE version=$2`,
+		[]byte{0}, "001_group_assignments")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 {
+		t.Fatalf("updated migration records = %d, want 1", rows)
+	}
+	if err := adapter.ApplyMigrations(ctx, db); !errors.Is(err, adapter.ErrMigrationDrift) {
+		t.Fatalf("ApplyMigrations after checksum drift = %v, want ErrMigrationDrift", err)
+	}
+}
+
 func Example() {
 	fmt.Println("go -C integration/postgres test -race -count=20 -v ./...")
 	// Output: go -C integration/postgres test -race -count=20 -v ./...
