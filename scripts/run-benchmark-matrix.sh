@@ -226,19 +226,27 @@ echo "environment_manifest=$environment_file"
 GOMAXPROCS="$gomaxprocs" go build -trimpath -o "$bin_dir/sgspbench" ./cmd/sgspbench
 GOMAXPROCS="$gomaxprocs" go build -trimpath -o "$bin_dir/sgspbenchreport" ./cmd/sgspbenchreport
 non_completed_trials=0
+expected_trials_file="$artifacts/expected-trials.tsv"
+: > "$expected_trials_file"
 
 run_trial() {
   local implementation=$1 clients=$2 hz=$3 rtt=$4 loss=$5 jitter=$6 reorder=$7 seed=$8 profile=$9
   local file="$raw_dir/${profile}-${implementation}-c${clients}-hz${hz}-rtt${rtt}-loss${loss}-j${jitter}-r${reorder}-seed${seed}.json"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$implementation" "$clients" "$hz" "$rtt" "$loss" "$jitter" "$reorder" "$seed" "$profile" "$file" >> "$expected_trials_file"
   if [[ $resume == 1 ]] && jq -e \
     --arg implementation "$implementation" \
     --argjson clients "$clients" \
     --argjson hz "$hz" \
+    --argjson loss "$loss" \
+    --argjson reorder "$reorder" \
     --argjson seed "$seed" \
     '.status == "completed" and
      .config.implementation == $implementation and
      .config.clients == $clients and
      .config.hz == $hz and
+     .config.loss == $loss and
+     .config.reorder == $reorder and
      .config.seed == $seed' "$file" >/dev/null 2>&1; then
     echo "resume_skip=$file"
     return
@@ -288,9 +296,43 @@ else
   done
 fi
 
+matrix_coverage_failures=0
+expected_trials=0
+while IFS=$'\t' read -r implementation clients hz rtt loss jitter reorder seed profile file; do
+  expected_trials=$((expected_trials + 1))
+  if [[ ! -s $file ]]; then
+    matrix_coverage_failures=$((matrix_coverage_failures + 1))
+    echo "matrix_missing_trial=$file" >&2
+    continue
+  fi
+  if ! jq -e \
+    --arg implementation "$implementation" \
+    --argjson clients "$clients" \
+    --argjson hz "$hz" \
+    --argjson loss "$loss" \
+    --argjson reorder "$reorder" \
+    --argjson seed "$seed" \
+    '.status == "completed" and
+     .config.implementation == $implementation and
+     .config.clients == $clients and
+     .config.hz == $hz and
+     .config.loss == $loss and
+     .config.reorder == $reorder and
+     .config.seed == $seed' "$file" >/dev/null; then
+    matrix_coverage_failures=$((matrix_coverage_failures + 1))
+    echo "matrix_incomplete_or_mismatched_trial=$file" >&2
+  fi
+done < "$expected_trials_file"
+if (( expected_trials == 0 )); then
+  matrix_coverage_failures=1
+  echo "matrix_expected_trial_plan_is_empty" >&2
+fi
+echo "matrix_expected_trials=$expected_trials"
+echo "matrix_coverage_failures=$matrix_coverage_failures"
+
 "$bin_dir/sgspbenchreport" --input "$raw_dir" --output "$artifacts/summary.md"
 echo "Artifacts written to $artifacts" >&2
-if (( non_completed_trials > 0 )); then
-  echo "matrix_non_completed_trials=$non_completed_trials" >&2
+if (( non_completed_trials > 0 || matrix_coverage_failures > 0 )); then
+  echo "matrix_non_completed_trials=$non_completed_trials matrix_coverage_failures=$matrix_coverage_failures" >&2
   exit 1
 fi
