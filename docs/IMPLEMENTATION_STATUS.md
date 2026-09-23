@@ -94,9 +94,6 @@ evidence.
 
 The following gates are still incomplete and must not be reported as passed:
 
-- M7's documented direct and bootstrap commands still need a retained
-  fresh-checkout operator exercise; automated and current-checkout local
-  operator evidence is recorded in `docs/milestones/M7.md`;
 - M8 capacity, impairment, and published comparison evidence. The
   benchmark harness now runs SGSP and bare-QUIC trials through deterministic
   per-client two-socket UDP relays with bounded timing histograms, correlated
