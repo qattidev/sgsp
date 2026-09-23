@@ -119,6 +119,21 @@ func assertSchemaSearchPath(t *testing.T, ctx context.Context, db *sql.DB, schem
 
 func quoteIdentifier(value string) string { return `"` + strings.ReplaceAll(value, `"`, `""`) + `"` }
 
+func TestQuoteIdentifier(t *testing.T) {
+	for _, test := range []struct {
+		value string
+		want  string
+	}{
+		{value: "plain", want: `"plain"`},
+		{value: `has"quote`, want: `"has""quote"`},
+		{value: "", want: `""`},
+	} {
+		if got := quoteIdentifier(test.value); got != test.want {
+			t.Errorf("quoteIdentifier(%q) = %q, want %q", test.value, got, test.want)
+		}
+	}
+}
+
 func TestConcurrentAssignment(t *testing.T) {
 	db := integrationDB(t)
 	store, err := adapter.New(db)
