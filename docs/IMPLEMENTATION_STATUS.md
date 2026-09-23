@@ -82,34 +82,21 @@ server-facing source port. It observes the QUIC probe, `PATH_CHALLENGE`, and
 that traffic continues with the original SGSP session epoch. This records
 same-epoch NAT-rebinding support for the pinned QUIC adapter.
 
-The following specification gates are still incomplete and must not be
-reported as passed:
+M3 and M5 implementation coverage is present and documented in the
+corresponding milestone records. It includes bounded reliable event/request
+body admission and directional `QueueBytes` accounting, `Call` response
+reservation, bounded control writes, slow-consumer closure, barrier-driven
+100-candidate resume races, credential-bound resumes, old-epoch reply/stream
+fencing, request/custom-stream loss cleanup, no-replay unknown outcomes,
+expired-ID retention, and the 1,000-cycle real-QUIC shutdown cleanup test.
+Those are implementation regression gates, not a replacement for M8 release
+evidence.
 
-- Reliable event and request stream readers reserve queue and
-  global-body capacity before consuming a declared payload, and `Call`
-  response bodies reserve global capacity before allocation. Short-lived
-  outbound frames and decoded `Call` bodies also reserve their separate,
-  resume-persistent per-session directional `QueueBytes` budgets; one maximum
-  request-reply body per direction has an exclusive reserve, while raw custom
-  streams avoid library-owned copy buffers. Control writes use their own
-  bounded per-connection queue and close with
-  `ResourceExhausted` on queue exhaustion. Both dispatch modes wait through
-  `SlowConsumerTimeout` for queued reliable work and then close, but this does
-  not complete the full gate;
-- broader terminal cleanup coverage from section 8. Barrier-driven
-  100-candidate concurrent commit, real lost-WELCOME retry with an unseen
-  epoch, positive and credential-bound resume cases, direct revocation,
-  pre-grace resume/post-grace expiry, a real-QUIC epoch-fencing test that
-  discards epoch-1 work, rejects stale reply/custom-stream writes, and
-  delivers only resumed epoch-2 work, a
-  real-QUIC pending request/custom-stream loss cleanup test, a
-  real-QUIC committed-request loss/resume test that records `OutcomeUnknown`
-  without replaying the committed operation,
-  interrupted reliable-stream loss handoff (which must not be relabeled as a
-  protocol violation), bounded expired-ID cache tests, and a real-QUIC
-  1,000-cycle shutdown-cleanup test (request, loss, explicit resume, close,
-  no retained session/application budget, and post-GC heap tolerance) are
-  present;
+The following gates are still incomplete and must not be reported as passed:
+
+- M7's documented direct and bootstrap commands still need a retained
+  fresh-checkout operator exercise; automated and current-checkout local
+  operator evidence is recorded in `docs/milestones/M7.md`;
 - M8 capacity, impairment, and published comparison evidence. The
   benchmark harness now runs SGSP and bare-QUIC trials through deterministic
   per-client two-socket UDP relays with bounded timing histograms, correlated
