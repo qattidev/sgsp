@@ -74,6 +74,12 @@ invocation and refuses to resume if its benchmark settings, Go version, or
 source snapshot differs. It retains the original manifest and writes a
 separate environment manifest for the resumed invocation.
 
+An invalid or failed trial writes its JSON before `sgspbench` exits nonzero.
+The matrix runner continues through the remaining trials, renders `summary.md`,
+and then exits nonzero when any result is non-completed. This preserves the
+failure evidence without allowing a failed performance gate to appear
+successful.
+
 The reconnect cases are a separate real-QUIC regression test, rather than
 synthetic benchmark samples. It blackholes both directions of an established
 UDP relay for 2, 8, and 40 seconds, verifies continuity, resume within grace,

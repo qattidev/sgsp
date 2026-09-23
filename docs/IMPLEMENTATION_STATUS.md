@@ -134,9 +134,12 @@ boundary-validation matrices
 `artifacts/measurement-boundary-readiness-smoke-20260922/` have no
 offered/accepted/delivered boundary inversion; the latter correctly invalidates
 all 20 short trials on this constrained host because scheduled input and/or
-bulk ticks were missed. These are harness diagnostics, not performance
-results. The five-seed 60-second capacity and plateau campaign, full
-impairment matrix at half that capacity, and published comparison remain
+bulk ticks were missed. The subsequent
+`artifacts/measurement-nonzero-smoke-20260923/` additionally confirms that
+all 20 invalid JSON records and the report are retained before the runner
+returns a nonzero failed-gate exit. These are harness diagnostics, not
+performance results. The five-seed 60-second capacity and plateau campaign,
+full impairment matrix at half that capacity, and published comparison remain
 incomplete.
 
 `TestReconnectBlackholeDurations` now performs the required real UDP-relay
