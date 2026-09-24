@@ -6,7 +6,8 @@ directionally negotiated message limits, messages, request/reply, custom
 streams, polling dispatch, and bounded fixed-worker handler dispatch (with
 per-session serialization and queued sequenced-update coalescing), logical close acknowledgement,
 reconnect/resume, bounded terminal-ID and group-tombstone retention, placement
-interfaces, memory and PostgreSQL adapters with an explicit migration runner,
+interfaces and a memory adapter, with PostgreSQL and SQLite stores maintained
+as separate Git submodules using SQLC and Goose (see `placement/README.md`),
 one-second bounded observer aggregation for session-state, handshake/resume,
 authentication, message, queue, request/stream, protocol, transport, and
 optional Bootstrap placement signals, and the direct/bootstrap action example

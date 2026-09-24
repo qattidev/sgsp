@@ -23,14 +23,28 @@ application / bootstrap service
 ```
 
 The application constructs the concrete adapter and passes it to
-`BootstrapConfig.Store`. SGSP must not import the adapter. A separate Go module
-inside this repository would isolate dependencies, but would still leave
-database details in the protocol repository.
+`BootstrapConfig.Store`. SGSP must not import the adapter. A nested Go module alone would isolate dependencies but still track database
+implementation in this repository. The submodules below instead own their
+source and history in separate Git repositories.
 
-**Current state:** `placement/postgres`, `integration/postgres`, and
-`scripts/run-postgres-integration.sh` still live here. They are existing code to
-extract, not the intended extension pattern. This README describes the target
-boundary and the handoff for that extraction; it does not move those files.
+## Adapter submodules
+
+Durable implementations are separate Git repositories and Go modules mounted
+as submodules in this checkout:
+
+| Backend | Checkout | Module |
+| --- | --- | --- |
+| PostgreSQL | [`adapters/postgres`](../adapters/postgres/README.md) | `qattidev/sgsp-postgres` |
+| SQLite | [`adapters/sqlite`](../adapters/sqlite/README.md) | `qattidev/sgsp-sqlite` |
+
+Both own their SQLC queries/generated code, embedded Goose migrations, database
+configuration, and integration tests. SGSP's module has no adapter dependencies.
+The memory adapter remains under `placement/memory` for development and tests.
+The old `qattidev/sgsp/placement/postgres` import is removed; applications must
+import `qattidev/sgsp-postgres` instead. Existing PostgreSQL schema adoption is
+documented in that adapter's README.
+
+See [`adapters/README.md`](../adapters/README.md) for local Git setup and commands.
 
 ## Store contract
 
@@ -122,34 +136,21 @@ draining, and capacity status. Persisting assignments does not implement owner
 discovery or heartbeats. A host may implement registry storage externally as
 well. Ungrouped resolution bypasses `AssignmentStore` entirely.
 
-## Handoff to a separate implementation context
+## Verification boundary
 
-Use the following scope in the application or adapter repository:
+Run SGSP tests with `go test ./...`. Nested adapter modules are intentionally
+excluded from that command. Run their tests separately:
 
-1. Create separate `sqlite` and `postgres` adapter packages implementing the
-   contract above. Keep schema design, database-specific concurrency mechanisms,
-   migrations, drivers, and operational documentation in that repository.
-   Each backend must establish the same observable behavior using its own
-   supported transactions and concurrency controls.
-2. Extract the existing `placement/postgres` implementation and migrations,
-   together with `integration/postgres` and its runner. Update module imports,
-   local development paths, and CI there. Preserve its concurrency and migration
-   tests. Add SQLite implementation and tests there, rather than translating
-   database details into the protocol package.
-3. Run the same behavioral contract against both backends: concurrent assignment
-   with different candidates, version conflicts, missing records, idempotent
-   closure, stale owner/incarnation rejection, assignment/closure races,
-   cancellation, outages, and persistence after reopening storage. Exercise
-   independent connections and adapter instances against a real backend.
-4. Test two bootstrap instances sharing storage: they must resolve one durable
-   winner and reject a group after committed closure. Verify unavailable or
-   restarted owners do not trigger automatic reassignment. Keep backend migration
-   and durability tests with the adapters.
-5. Once the external adapter is available and consumers have updated imports,
-   remove the in-repository PostgreSQL package, integration module, and runner.
-   Update active documentation and checks that reference them; retain historical
-   milestone evidence as history. This removes the old public import path and
-   must be communicated to its consumers.
+```sh
+go -C adapters/sqlite test -race ./...
+SGSP_TEST_DATABASE_URL=... go -C adapters/postgres test -race ./...
+```
+
+Each adapter owns contract tests for competing assignments, version conflicts,
+missing records, idempotent closure, stale owners, assignment/closure races,
+cancellation, outages, persistence after reopening, and two bootstrap instances.
+Database migrations and SQLC generation are checked in the adapter repositories.
+Historical milestone evidence retains the original paths as history.
 
 No SGSP wire-format change is required. New backends plug into the existing
 store contract; only the host's construction and deployment configuration change.

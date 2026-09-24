@@ -1,0 +1,6 @@
+[submodule "adapters/postgres"]
+	path = adapters/postgres
+	url = git@github.com:qattidev/sgsp-adapters-postgres.git
+[submodule "adapters/sqlite"]
+	path = adapters/sqlite
+	url = git@github.com:qattidev/sgsp-adapters-sqlite.git
