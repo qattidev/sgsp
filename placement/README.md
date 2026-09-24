@@ -41,8 +41,7 @@ Both own their SQLC queries/generated code, embedded Goose migrations, database
 configuration, and integration tests. SGSP's module has no adapter dependencies.
 The memory adapter remains under `placement/memory` for development and tests.
 The old `qattidev/sgsp/placement/postgres` import is removed; applications must
-import `qattidev/sgsp-postgres` instead. Existing PostgreSQL schema adoption is
-documented in that adapter's README.
+import `qattidev/sgsp-postgres` instead.
 
 See [`adapters/README.md`](../adapters/README.md) for local Git setup and commands.
 
