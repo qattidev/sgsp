@@ -327,5 +327,3 @@ type Server interface {
 	CloseGroup(context.Context, string) error
 	Drain(context.Context) error
 }
-
-// NewServer is intentionally unavailable until the endpoint implementation lands.

@@ -1,7 +1,7 @@
 // Package sgsp provides the public API for the Simple Game Server Protocol.
 //
-// This M0 package deliberately establishes API ownership only. Networking,
-// framing, authentication, and dispatch are implemented in later milestones.
+// It implements authenticated QUIC sessions, messaging, request/reply,
+// application streams, and reconnect/resume support.
 package sgsp
 
 import (
